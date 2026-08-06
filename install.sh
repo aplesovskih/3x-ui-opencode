@@ -532,7 +532,7 @@ EOF
     fi
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx
-    ok "nginx настроен: ${PROXY_SCHEME}://${IP}:${PROXY_PORT}"
+    ok "nginx настроен: $(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT")"
 }
 
 # -----------------------------------------------------------------------------
@@ -618,7 +618,7 @@ EOF
         journalctl -u caddy -n 20 --no-pager 2>/dev/null || true
         exit 1
     fi
-    ok "caddy настроен: ${PROXY_SCHEME}://${IP}:${PROXY_PORT}"
+    ok "caddy настроен: $(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT")"
 }
 
 # -----------------------------------------------------------------------------
@@ -678,6 +678,31 @@ setup_selinux() {
 }
 
 # -----------------------------------------------------------------------------
+#  Формирование внешнего URL
+#
+#  Порт опускается, если он стандартный для схемы (https+443, http+80) —
+#  браузер подставит его сам.
+# -----------------------------------------------------------------------------
+build_url() {
+    local SCHEME="$1"
+    local HOST="$2"
+    local PORT="$3"
+    local PATH_TAIL="${4:-}"
+    local URL="${SCHEME}://${HOST}"
+    PATH_TAIL="${PATH_TAIL#/}"
+
+    if ! { [ "$SCHEME" = "https" ] && [ "$PORT" = "443" ]; } && \
+       ! { [ "$SCHEME" = "http" ] && [ "$PORT" = "80" ]; }; then
+        URL="${URL}:${PORT}"
+    fi
+
+    if [ -n "$PATH_TAIL" ]; then
+        URL="${URL}/${PATH_TAIL}"
+    fi
+    echo "$URL"
+}
+
+# -----------------------------------------------------------------------------
 #  Итоговая сводка
 # -----------------------------------------------------------------------------
 print_summary() {
@@ -686,9 +711,9 @@ print_summary() {
     # Рабочий адрес доступа: через прокси или напрямую к панели
     local ACCESS_URL
     if [ "$PROXY" = "none" ]; then
-        ACCESS_URL="${PANEL_PROTO}://${IP}:${PANEL_PORT}/${PANEL_PATH_NORM}"
+        ACCESS_URL="$(build_url "$PANEL_PROTO" "$IP" "$PANEL_PORT" "$PANEL_PATH_NORM")"
     else
-        ACCESS_URL="${PROXY_SCHEME}://${IP}:${PROXY_PORT}/${PANEL_PATH_NORM}"
+        ACCESS_URL="$(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT" "$PANEL_PATH_NORM")"
     fi
 
     echo
@@ -699,7 +724,7 @@ print_summary() {
         echo "   Прокси не выбран — панель работает напрямую."
     else
         echo "   Прокси:      ${PROXY}"
-        echo "   Панель:      ${PROXY_SCHEME}://${IP}:${PROXY_PORT}/${PANEL_PATH_NORM}"
+        echo "   Панель:      $(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT" "$PANEL_PATH_NORM")"
         echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}/${PANEL_PATH_NORM}"
         echo "   Прямой доступ к панели закрыт — только порт прокси."
     fi
