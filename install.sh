@@ -23,6 +23,7 @@ PROXY="none"                          # выбранный прокси: nginx /
 IP=""                                 # публичный IP сервера
 PKG_MANAGER="apt-get"                 # менеджер пакетов
 OS_FAMILY="debian"                    # семейство ОС: debian / rhel
+XUI_INSTALL_LOG="/var/log/3x-ui-install.log"   # лог вывода официального установщика
 
 # Цвета для вывода
 RED=$'\033[0;31m'
@@ -130,7 +131,8 @@ install_3xui() {
         install_pkg curl
     fi
     ok "Запускаем официальный установщик 3x-ui (следуйте подсказкам установщика)..."
-    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+    ok "Его вывод сохраняется в ${XUI_INSTALL_LOG}."
+    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) 2>&1 | tee "$XUI_INSTALL_LOG"
     if ! command -v x-ui >/dev/null 2>&1; then
         err "3x-ui не установился. Проверьте вывод установщика выше."
         exit 1
@@ -289,18 +291,27 @@ EOF
 #  Настройка firewall (ufw / firewalld)
 # -----------------------------------------------------------------------------
 setup_firewall() {
+    # Список портов для открытия: при прокси — порт прокси и порт панели,
+    # без прокси — только порт панели
+    local PORTS="${PROXY_PORT} ${PANEL_PORT}"
+    if [ "$PROXY" = "none" ]; then
+        PORTS="${PANEL_PORT}"
+    fi
+
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${PROXY_PORT}"/tcp >/dev/null
-        ufw allow "${PANEL_PORT}"/tcp >/dev/null
-        ok "Правила ufw добавлены (порты ${PROXY_PORT}, ${PANEL_PORT})."
+        for p in $PORTS; do
+            ufw allow "${p}"/tcp >/dev/null
+        done
+        ok "Правила ufw добавлены (порты $(echo "$PORTS" | tr ' ' ', '))."
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${PROXY_PORT}"/tcp >/dev/null
-        firewall-cmd --permanent --add-port="${PANEL_PORT}"/tcp >/dev/null
+        for p in $PORTS; do
+            firewall-cmd --permanent --add-port="${p}"/tcp >/dev/null
+        done
         firewall-cmd --reload >/dev/null
-        ok "Правила firewalld добавлены (порты ${PROXY_PORT}, ${PANEL_PORT})."
+        ok "Правила firewalld добавлены (порты $(echo "$PORTS" | tr ' ' ', '))."
     else
         warn "Активный firewall (ufw/firewalld) не обнаружен."
-        warn "При необходимости откройте вручную порты: ${PROXY_PORT}/tcp, ${PANEL_PORT}/tcp."
+        warn "При необходимости откройте вручную порты: $(echo "$PORTS" | tr ' ' ', ')/tcp."
     fi
 }
 
@@ -327,14 +338,13 @@ print_summary() {
     echo "   Установка завершена"
     echo "═══════════════════════════════════════════════"
     if [ "$PROXY" = "none" ]; then
-        echo "   Панель:      ${PANEL_PROTO}://${IP}:${PANEL_PORT}"
+        echo "   Прокси не выбран — панель работает напрямую."
     else
         echo "   Прокси:      ${PROXY}"
         echo "   Панель:      http://${IP}:${PROXY_PORT}"
         echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}"
     fi
     echo
-    echo "   Учётные данные панели — те, что были выведены при установке 3x-ui."
     echo "   Управление панелью из терминала:  x-ui"
     echo "   Статус службы:                    systemctl status x-ui"
     if [ "$PROXY" = "nginx" ]; then
@@ -343,6 +353,15 @@ print_summary() {
         echo "   Статус caddy:                     systemctl status caddy"
     fi
     echo "═══════════════════════════════════════════════"
+    echo
+    echo "═══════════════════════════════════════════════"
+    echo "   Данные, выведенные установщиком 3x-ui:"
+    echo "═══════════════════════════════════════════════"
+    if [ -s "$XUI_INSTALL_LOG" ]; then
+        tail -n 40 "$XUI_INSTALL_LOG"
+    else
+        warn "Лог установщика (${XUI_INSTALL_LOG}) не найден или пуст."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -364,14 +383,21 @@ main() {
     detect_ip
     install_3xui
     ask_panel_port
-    detect_panel_proto
     choose_proxy
 
     # Настройка в зависимости от выбранного прокси
     case "$PROXY" in
-        nginx) setup_nginx ;;
-        caddy) setup_caddy ;;
-        none)  ok "Прокси не выбран — панель работает напрямую." ;;
+        nginx)
+            detect_panel_proto
+            setup_nginx
+            ;;
+        caddy)
+            detect_panel_proto
+            setup_caddy
+            ;;
+        none)
+            ok "Прокси не выбран — панель работает напрямую."
+            ;;
     esac
 
     setup_firewall
