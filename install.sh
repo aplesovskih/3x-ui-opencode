@@ -20,7 +20,7 @@ PANEL_PORT=""                        # порт веб-панели 3x-ui (оп�
 PANEL_PROTO="http"                    # протокол панели (http/https), определяется автоматически
 PANEL_CERT=""                        # путь к fullchain.pem панели (для TLS на прокси)
 PANEL_KEY=""                         # путь к privkey.pem панели
-PROXY_PORT="8443"                     # порт прокси
+PROXY_PORT="443"                      # порт прокси
 PROXY_SCHEME="http"                   # внешний протокол прокси (http/https)
 PROXY="none"                          # выбранный прокси: nginx / caddy / none
 IP=""                                 # публичный IP сервера
@@ -410,6 +410,17 @@ detect_panel_cert() {
 # -----------------------------------------------------------------------------
 #  Интерактивный выбор прокси-сервера
 # -----------------------------------------------------------------------------
+# Проверка, что порт прокси не занят (например, xray-inbound на 443)
+check_proxy_port() {
+    if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :${PROXY_PORT}" 2>/dev/null | grep -q .; then
+        warn "Порт ${PROXY_PORT} уже занят (возможно, xray-inbound на 443)."
+        read -rp "Указать другой порт (Enter — оставить ${PROXY_PORT}): " P
+        if [ -n "$P" ]; then
+            PROXY_PORT="$P"
+        fi
+    fi
+}
+
 choose_proxy() {
     echo
     echo "═══════════════════════════════════════════════"
@@ -432,6 +443,7 @@ choose_proxy() {
         PROXY_NAME="$PROXY"
         read -rp "Порт прокси (по умолчанию ${PROXY_PORT}): " P
         PROXY_PORT="${P:-${PROXY_PORT}}"
+        check_proxy_port
     fi
 
     ok "Выбран прокси: ${PROXY_NAME}"
