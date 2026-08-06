@@ -4,9 +4,7 @@
 #
 #  Возможности:
 #   - установка 3x-ui официальным установщиком;
-#   - выбор прокси-сервера: nginx / caddy / без прокси;
-#   - выдача сертификата по IP-адресу сервера: self-signed или ZeroSSL;
-#   - настройка TLS и reverse proxy;
+#   - выбор и настройка прокси-сервера: nginx / caddy / без прокси;
 #   - настройка firewall.
 #
 #  Запуск с GitHub:
@@ -20,16 +18,11 @@ set -u
 # -----------------------------------------------------------------------------
 PANEL_PORT="2053"                     # порт веб-панели 3x-ui
 PANEL_PROTO="http"                    # протокол панели (http/https), определяется автоматически
-PROXY_PORT="8443"                     # HTTPS-порт прокси
+PROXY_PORT="8080"                     # порт прокси
 PROXY="none"                          # выбранный прокси: nginx / caddy / none
-CERT_MODE="selfsigned"                # способ выдачи сертификата
-CERT_DIR="/etc/ssl/x-ui"              # каталог сертификатов
-CERT_PATH="${CERT_DIR}/cert.pem"      # путь к сертификату
-KEY_PATH="${CERT_DIR}/key.pem"        # путь к ключу
 IP=""                                 # публичный IP сервера
 PKG_MANAGER="apt-get"                 # менеджер пакетов
 OS_FAMILY="debian"                    # семейство ОС: debian / rhel
-RELOAD_CMD="systemctl restart x-ui"   # команда перезагрузки после обновления сертификата
 
 # Цвета для вывода
 RED=$'\033[0;31m'
@@ -117,9 +110,6 @@ detect_ip() {
         err "Не удалось определить IP сервера."
         exit 1
     fi
-    case "$IP" in
-        *:*) warn "Обнаружен IPv6-адрес (${IP}); сертификаты лучше выписывать для IPv4." ;;
-    esac
     ok "IP сервера: ${IP}"
 }
 
@@ -140,7 +130,6 @@ install_3xui() {
         install_pkg curl
     fi
     ok "Запускаем официальный установщик 3x-ui (следуйте подсказкам установщика)..."
-    ok "Подсказка: на вопрос про выдачу SSL-сертификата ответьте 'нет' — сертификат мы выдадим сами."
     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
     if ! command -v x-ui >/dev/null 2>&1; then
         err "3x-ui не установился. Проверьте вывод установщика выше."
@@ -190,97 +179,11 @@ choose_proxy() {
         PROXY_NAME="без прокси"
     else
         PROXY_NAME="$PROXY"
-        read -rp "HTTPS-порт прокси (по умолчанию ${PROXY_PORT}): " P
+        read -rp "Порт прокси (по умолчанию ${PROXY_PORT}): " P
         PROXY_PORT="${P:-${PROXY_PORT}}"
     fi
 
-    case "$PROXY" in
-        nginx) RELOAD_CMD="systemctl reload nginx || systemctl restart nginx" ;;
-        caddy) RELOAD_CMD="systemctl reload caddy || systemctl restart caddy" ;;
-        none)  RELOAD_CMD="systemctl restart x-ui" ;;
-    esac
     ok "Выбран прокси: ${PROXY_NAME}"
-}
-
-# -----------------------------------------------------------------------------
-#  Интерактивный выбор способа выдачи сертификата по IP
-# -----------------------------------------------------------------------------
-choose_cert() {
-    echo
-    echo "═══════════════════════════════════════════════"
-    echo "  Выдача сертификата по IP: ${IP}"
-    echo "═══════════════════════════════════════════════"
-    echo "  1) Self-signed (openssl) — работает сразу, срок 365 дней"
-    echo "  2) ZeroSSL — валидный сертификат по IP, нужен свободный порт 80"
-    read -rp "Ваш выбор [1-2] (по умолчанию 1): " C
-    case "${C:-1}" in
-        1) CERT_MODE="selfsigned" ;;
-        2) CERT_MODE="zerossl" ;;
-        *) warn "Неверный выбор, используем self-signed."; CERT_MODE="selfsigned" ;;
-    esac
-    mkdir -p "$CERT_DIR"
-    CERT_PATH="${CERT_DIR}/cert.pem"
-    KEY_PATH="${CERT_DIR}/key.pem"
-}
-
-# -----------------------------------------------------------------------------
-#  Self-signed сертификат через openssl (SAN = IP сервера)
-# -----------------------------------------------------------------------------
-issue_selfsigned() {
-    log "Генерируем self-signed сертификат для IP ${IP} (срок 365 дней)..."
-    openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
-        -keyout "$KEY_PATH" -out "$CERT_PATH" -days 365 \
-        -subj "/CN=${IP}" \
-        -addext "subjectAltName=IP:${IP}" >/dev/null 2>&1
-    chmod 644 "$CERT_PATH"
-    chmod 600 "$KEY_PATH"
-    ok "Сертификат создан: ${CERT_PATH}"
-}
-
-# -----------------------------------------------------------------------------
-#  Валидный сертификат по IP через acme.sh + ZeroSSL (HTTP-01, порт 80)
-# -----------------------------------------------------------------------------
-issue_zerossl() {
-    if ! command -v socat >/dev/null 2>&1; then
-        log "Устанавливаем socat..."
-        install_pkg socat
-    fi
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ':80$'; then
-        err "Порт 80 занят, а он необходим для проверки ZeroSSL (HTTP-01)."
-        err "Остановите сервис на порту 80 или выберите self-signed."
-        exit 1
-    fi
-    read -rp "Ваш email для регистрации на ZeroSSL: " ZEROSSL_EMAIL
-    if [ -z "$ZEROSSL_EMAIL" ]; then
-        err "Email обязателен для ZeroSSL."
-        exit 1
-    fi
-    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
-        log "Устанавливаем acme.sh..."
-        curl -fsSL https://get.acme.sh | sh -s email="$ZEROSSL_EMAIL"
-    fi
-    log "Запрашиваем сертификат ZeroSSL для IP ${IP}..."
-    "$HOME/.acme.sh/acme.sh" --issue --server zerossl -d "$IP" \
-        --standalone --force --accountemail "$ZEROSSL_EMAIL"
-    log "Устанавливаем сертификат в ${CERT_DIR}..."
-    "$HOME/.acme.sh/acme.sh" --install-cert -d "$IP" \
-        --fullchain-file "$CERT_PATH" \
-        --key-file "$KEY_PATH" \
-        --reloadcmd "$RELOAD_CMD"
-    chmod 644 "$CERT_PATH"
-    chmod 600 "$KEY_PATH"
-    ok "Сертификат ZeroSSL установлен (автопродление через acme.sh)."
-}
-
-# -----------------------------------------------------------------------------
-#  Применение сертификата к самой панели (режим "без прокси")
-# -----------------------------------------------------------------------------
-setup_panel_tls() {
-    log "Применяем сертификат к панели 3x-ui..."
-    x-ui settings -webCertPath "$CERT_PATH"
-    x-ui settings -webKeyPath "$KEY_PATH"
-    systemctl restart x-ui
-    ok "Панель переведена на HTTPS."
 }
 
 # -----------------------------------------------------------------------------
@@ -307,12 +210,8 @@ EOF
 
     cat > /etc/nginx/conf.d/x-ui.conf <<EOF
 server {
-    listen ${PROXY_PORT} ssl;
+    listen ${PROXY_PORT};
     server_name _;
-
-    ssl_certificate ${CERT_PATH};
-    ssl_certificate_key ${KEY_PATH};
-    ssl_protocols TLSv1.2 TLSv1.3;
 
     location / {
         proxy_pass ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT};
@@ -337,7 +236,7 @@ EOF
     fi
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx
-    ok "nginx настроен: https://${IP}:${PROXY_PORT}"
+    ok "nginx настроен: http://${IP}:${PROXY_PORT}"
 }
 
 # -----------------------------------------------------------------------------
@@ -362,7 +261,6 @@ setup_caddy() {
     if [ "$PANEL_PROTO" = "https" ]; then
         cat > /etc/caddy/Caddyfile <<EOF
 :${PROXY_PORT} {
-    tls ${CERT_PATH} ${KEY_PATH}
     reverse_proxy https://127.0.0.1:${PANEL_PORT} {
         transport http {
             tls_insecure_skip_verify
@@ -373,7 +271,6 @@ EOF
     else
         cat > /etc/caddy/Caddyfile <<EOF
 :${PROXY_PORT} {
-    tls ${CERT_PATH} ${KEY_PATH}
     reverse_proxy http://127.0.0.1:${PANEL_PORT}
 }
 EOF
@@ -385,7 +282,7 @@ EOF
         journalctl -u caddy -n 20 --no-pager 2>/dev/null || true
         exit 1
     fi
-    ok "caddy настроен: https://${IP}:${PROXY_PORT}"
+    ok "caddy настроен: http://${IP}:${PROXY_PORT}"
 }
 
 # -----------------------------------------------------------------------------
@@ -393,19 +290,17 @@ EOF
 # -----------------------------------------------------------------------------
 setup_firewall() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow 80/tcp >/dev/null
         ufw allow "${PROXY_PORT}"/tcp >/dev/null
         ufw allow "${PANEL_PORT}"/tcp >/dev/null
-        ok "Правила ufw добавлены (порты 80, ${PROXY_PORT}, ${PANEL_PORT})."
+        ok "Правила ufw добавлены (порты ${PROXY_PORT}, ${PANEL_PORT})."
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port=80/tcp >/dev/null
         firewall-cmd --permanent --add-port="${PROXY_PORT}"/tcp >/dev/null
         firewall-cmd --permanent --add-port="${PANEL_PORT}"/tcp >/dev/null
         firewall-cmd --reload >/dev/null
-        ok "Правила firewalld добавлены (порты 80, ${PROXY_PORT}, ${PANEL_PORT})."
+        ok "Правила firewalld добавлены (порты ${PROXY_PORT}, ${PANEL_PORT})."
     else
         warn "Активный firewall (ufw/firewalld) не обнаружен."
-        warn "При необходимости откройте вручную порты: 80/tcp, ${PROXY_PORT}/tcp, ${PANEL_PORT}/tcp."
+        warn "При необходимости откройте вручную порты: ${PROXY_PORT}/tcp, ${PANEL_PORT}/tcp."
     fi
 }
 
@@ -432,14 +327,12 @@ print_summary() {
     echo "   Установка завершена"
     echo "═══════════════════════════════════════════════"
     if [ "$PROXY" = "none" ]; then
-        echo "   Панель:      https://${IP}:${PANEL_PORT}"
+        echo "   Панель:      ${PANEL_PROTO}://${IP}:${PANEL_PORT}"
     else
         echo "   Прокси:      ${PROXY}"
-        echo "   Панель:      https://${IP}:${PROXY_PORT}"
+        echo "   Панель:      http://${IP}:${PROXY_PORT}"
         echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}"
     fi
-    echo "   Сертификат:  ${CERT_PATH}"
-    echo "   Ключ:        ${KEY_PATH}"
     echo
     echo "   Учётные данные панели — те, что были выведены при установке 3x-ui."
     echo "   Управление панелью из терминала:  x-ui"
@@ -461,34 +354,24 @@ main() {
     echo "═══════════════════════════════════════════════"
     echo "  Установка панели 3x-ui"
     echo "  Выбор прокси: nginx / caddy / без прокси"
-    echo "  Сертификат по IP: self-signed / ZeroSSL"
     echo "═══════════════════════════════════════════════"
 
     detect_os
 
     log "Проверяем зависимости..."
     if ! command -v curl >/dev/null 2>&1; then install_pkg curl; fi
-    if ! command -v openssl >/dev/null 2>&1; then install_pkg openssl; fi
 
     detect_ip
     install_3xui
     ask_panel_port
     detect_panel_proto
     choose_proxy
-    choose_cert
-
-    # Выдача сертификата по IP
-    if [ "$CERT_MODE" = "selfsigned" ]; then
-        issue_selfsigned
-    else
-        issue_zerossl
-    fi
 
     # Настройка в зависимости от выбранного прокси
     case "$PROXY" in
         nginx) setup_nginx ;;
         caddy) setup_caddy ;;
-        none)  setup_panel_tls ;;
+        none)  ok "Прокси не выбран — панель работает напрямую." ;;
     esac
 
     setup_firewall
