@@ -18,7 +18,10 @@ set -u
 # -----------------------------------------------------------------------------
 PANEL_PORT=""                        # порт веб-панели 3x-ui (определяется автоматически)
 PANEL_PROTO="http"                    # протокол панели (http/https), определяется автоматически
+PANEL_CERT=""                        # путь к fullchain.pem панели (для TLS на прокси)
+PANEL_KEY=""                         # путь к privkey.pem панели
 PROXY_PORT="8443"                     # порт прокси
+PROXY_SCHEME="http"                   # внешний протокол прокси (http/https)
 PROXY="none"                          # выбранный прокси: nginx / caddy / none
 IP=""                                 # публичный IP сервера
 PKG_MANAGER="apt-get"                 # менеджер пакетов
@@ -381,6 +384,30 @@ detect_panel_proto() {
 }
 
 # -----------------------------------------------------------------------------
+#  Поиск сертификата панели (fullchain.pem + privkey.pem) в /root/cert
+# -----------------------------------------------------------------------------
+detect_panel_cert() {
+    PANEL_CERT=""
+    PANEL_KEY=""
+    local d
+
+    # Каталоги сертификатов официального установщика 3x-ui:
+    #   /root/cert/ip        — самоподписанный сертификат по IP;
+    #   /root/cert/<домен>   — сертификат для домена (Let's Encrypt).
+    for d in /root/cert/ip /root/cert/*; do
+        [ -d "$d" ] || continue
+        if [ -f "$d/fullchain.pem" ] && [ -f "$d/privkey.pem" ]; then
+            PANEL_CERT="$d/fullchain.pem"
+            PANEL_KEY="$d/privkey.pem"
+            ok "Сертификат панели найден: ${PANEL_CERT}"
+            return 0
+        fi
+    done
+    warn "Сертификат панели не найден в /root/cert."
+    warn "Без него TLS на прокси недоступен — вход по http:// может давать 403 (Secure-cookie)."
+}
+
+# -----------------------------------------------------------------------------
 #  Интерактивный выбор прокси-сервера
 # -----------------------------------------------------------------------------
 choose_proxy() {
@@ -427,14 +454,25 @@ EOF
 
     # Дополнительные директивы, если панель сама на HTTPS
     local SSL_UPSTREAM=""
+    local LISTEN_DIRECTIVES="    listen ${PROXY_PORT};"
     if [ "$PANEL_PROTO" = "https" ]; then
         SSL_UPSTREAM="        proxy_ssl_verify off;
         proxy_ssl_server_name off;"
+        # TLS на прокси: внешний доступ по https, чтобы браузер сохранял
+        # Secure-cookie панели (иначе вход даёт 403 из-за CSRF)
+        if [ -n "$PANEL_CERT" ] && [ -n "$PANEL_KEY" ]; then
+            PROXY_SCHEME="https"
+            LISTEN_DIRECTIVES="    listen ${PROXY_PORT} ssl;
+    ssl_certificate     ${PANEL_CERT};
+    ssl_certificate_key ${PANEL_KEY};"
+        else
+            warn "Панель на HTTPS, сертификат не найден — прокси работает без TLS, вход в панель может давать 403."
+        fi
     fi
 
     cat > /etc/nginx/conf.d/x-ui.conf <<EOF
 server {
-    listen ${PROXY_PORT};
+${LISTEN_DIRECTIVES}
     server_name _;
 
     location / {
@@ -460,7 +498,7 @@ EOF
     fi
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx
-    ok "nginx настроен: http://${IP}:${PROXY_PORT}"
+    ok "nginx настроен: ${PROXY_SCHEME}://${IP}:${PROXY_PORT}"
 }
 
 # -----------------------------------------------------------------------------
@@ -483,7 +521,22 @@ setup_caddy() {
     fi
 
     if [ "$PANEL_PROTO" = "https" ]; then
-        cat > /etc/caddy/Caddyfile <<EOF
+        # TLS на прокси, если найден сертификат панели (Secure-cookie при https)
+        if [ -n "$PANEL_CERT" ] && [ -n "$PANEL_KEY" ]; then
+            PROXY_SCHEME="https"
+            cat > /etc/caddy/Caddyfile <<EOF
+:${PROXY_PORT} {
+    tls ${PANEL_CERT} ${PANEL_KEY}
+    reverse_proxy https://127.0.0.1:${PANEL_PORT} {
+        transport http {
+            tls_insecure_skip_verify
+        }
+    }
+}
+EOF
+        else
+            warn "Панель на HTTPS, сертификат не найден — прокси работает без TLS, вход в панель может давать 403."
+            cat > /etc/caddy/Caddyfile <<EOF
 :${PROXY_PORT} {
     reverse_proxy https://127.0.0.1:${PANEL_PORT} {
         transport http {
@@ -492,6 +545,7 @@ setup_caddy() {
     }
 }
 EOF
+        fi
     else
         cat > /etc/caddy/Caddyfile <<EOF
 :${PROXY_PORT} {
@@ -506,34 +560,46 @@ EOF
         journalctl -u caddy -n 20 --no-pager 2>/dev/null || true
         exit 1
     fi
-    ok "caddy настроен: http://${IP}:${PROXY_PORT}"
+    ok "caddy настроен: ${PROXY_SCHEME}://${IP}:${PROXY_PORT}"
 }
 
 # -----------------------------------------------------------------------------
 #  Настройка firewall (ufw / firewalld)
 # -----------------------------------------------------------------------------
 setup_firewall() {
-    # Список портов для открытия: при прокси — порт прокси и порт панели,
-    # без прокси — только порт панели
-    local PORTS="${PROXY_PORT} ${PANEL_PORT}"
+    # Без прокси наружу открыт порт панели.
+    # С прокси наружу открыт ТОЛЬКО порт прокси, а порт панели закрывается —
+    # доступ к панели возможен только через прокси.
+    local PORTS=""
+    local CLOSE=""
     if [ "$PROXY" = "none" ]; then
         PORTS="${PANEL_PORT}"
+    else
+        PORTS="${PROXY_PORT}"
+        CLOSE="${PANEL_PORT}"
     fi
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         for p in $PORTS; do
             ufw allow "${p}"/tcp >/dev/null
         done
-        ok "Правила ufw добавлены (порты $(echo "$PORTS" | tr ' ' ', '))."
+        # закрываем порт панели, если правило осталось от прошлой установки
+        if [ -n "$CLOSE" ]; then
+            ufw delete allow "${CLOSE}"/tcp >/dev/null 2>&1 || true
+        fi
+        ok "ufw: открыт порт ${PORTS}/tcp; прямой доступ к панели (${CLOSE:-—}/tcp) закрыт."
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         for p in $PORTS; do
             firewall-cmd --permanent --add-port="${p}"/tcp >/dev/null
         done
+        if [ -n "$CLOSE" ]; then
+            firewall-cmd --permanent --remove-port="${CLOSE}"/tcp >/dev/null 2>&1 || true
+        fi
         firewall-cmd --reload >/dev/null
-        ok "Правила firewalld добавлены (порты $(echo "$PORTS" | tr ' ' ', '))."
+        ok "firewalld: открыт порт ${PORTS}/tcp; прямой доступ к панели (${CLOSE:-—}/tcp) закрыт."
     else
         warn "Активный firewall (ufw/firewalld) не обнаружен."
-        warn "При необходимости откройте вручную порты: $(echo "$PORTS" | tr ' ' ', ')/tcp."
+        warn "При необходимости откройте вручную порт: ${PORTS}/tcp."
     fi
 }
 
@@ -557,6 +623,13 @@ setup_selinux() {
 print_summary() {
     # Нормализуем путь: убираем ведущий слэш, чтобы URL был http://IP:PORT/path
     local PANEL_PATH_NORM="${PANEL_PATH#/}"
+    # Рабочий адрес доступа: через прокси или напрямую к панели
+    local ACCESS_URL
+    if [ "$PROXY" = "none" ]; then
+        ACCESS_URL="${PANEL_PROTO}://${IP}:${PANEL_PORT}/${PANEL_PATH_NORM}"
+    else
+        ACCESS_URL="${PROXY_SCHEME}://${IP}:${PROXY_PORT}/${PANEL_PATH_NORM}"
+    fi
 
     echo
     echo "═══════════════════════════════════════════════"
@@ -566,8 +639,9 @@ print_summary() {
         echo "   Прокси не выбран — панель работает напрямую."
     else
         echo "   Прокси:      ${PROXY}"
-        echo "   Панель:      http://${IP}:${PROXY_PORT}/${PANEL_PATH_NORM}"
+        echo "   Панель:      ${PROXY_SCHEME}://${IP}:${PROXY_PORT}/${PANEL_PATH_NORM}"
         echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}/${PANEL_PATH_NORM}"
+        echo "   Прямой доступ к панели закрыт — только порт прокси."
     fi
     echo
     echo "   Управление панелью из терминала:  x-ui"
@@ -586,7 +660,7 @@ print_summary() {
     echo "   Password:    ${PANEL_PASSWORD:-не определено}"
     echo "   Port:        ${PANEL_PORT}"
     echo "   WebBasePath: ${PANEL_PATH_NORM:-/}"
-    echo "   Access URL:  ${PANEL_PROTO}://${IP}:${PANEL_PORT}/${PANEL_PATH_NORM}"
+    echo "   Access URL:  ${ACCESS_URL}"
     echo "   API Token:   ${PANEL_TOKEN:-не определено}"
     echo "═══════════════════════════════════════════════"
 }
@@ -612,6 +686,11 @@ main() {
     check_cert_issue
     load_panel_config
     choose_proxy
+
+    # Сертификат панели нужен только при прокси (для TLS на прокси)
+    if [ "$PROXY" != "none" ]; then
+        detect_panel_cert
+    fi
 
     # Настройка в зависимости от выбранного прокси
     case "$PROXY" in
