@@ -141,6 +141,163 @@ install_3xui() {
 }
 
 # -----------------------------------------------------------------------------
+#  Чтение лога выпуска сертификата и обработка ошибок
+# -----------------------------------------------------------------------------
+# Применение сертификата к панели (путь к fullchain и ключу)
+apply_cert_to_panel() {
+    local CERT_FULL="$1"
+    local CERT_KEY="$2"
+    if [ -f "$CERT_FULL" ] && [ -f "$CERT_KEY" ]; then
+        /usr/local/x-ui/x-ui cert -webCert "$CERT_FULL" -webCertKey "$CERT_KEY" >/dev/null 2>&1
+        systemctl restart x-ui >/dev/null 2>&1 || true
+        ok "Сертификат применён к панели: ${CERT_FULL}"
+    else
+        warn "Файлы сертификата не найдены (${CERT_FULL})."
+    fi
+}
+
+# Выпуск self-signed сертификата с SAN=IP
+issue_selfsigned_cert() {
+    local CERT_DIR="/root/cert/selfsigned"
+    if ! command -v openssl >/dev/null 2>&1; then
+        log "Устанавливаем openssl..."
+        install_pkg openssl
+    fi
+    mkdir -p "$CERT_DIR"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -subj "/CN=${IP}" \
+        -addext "subjectAltName=IP:${IP}" \
+        -keyout "$CERT_DIR/privkey.pem" \
+        -out "$CERT_DIR/fullchain.pem" >/dev/null 2>&1
+    chmod 600 "$CERT_DIR/privkey.pem"
+    chmod 644 "$CERT_DIR/fullchain.pem"
+    ok "Self-signed сертификат выпущен (SAN=IP)."
+    apply_cert_to_panel "$CERT_DIR/fullchain.pem" "$CERT_DIR/privkey.pem"
+}
+
+# Выпуск ZeroSSL сертификата через acme.sh (HTTP-01, нужен открытый порт 80)
+issue_zerossl_cert() {
+    local ACME_SH="${HOME}/.acme.sh/acme.sh"
+    local CERT_DIR="/root/cert/zerossl"
+    local EMAIL
+    local ADDR="$IP"
+
+    if [ ! -x "$ACME_SH" ]; then
+        log "Устанавливаем acme.sh..."
+        curl -s https://get.acme.sh | sh >/dev/null 2>&1 || true
+        if [ ! -x "$ACME_SH" ]; then
+            err "Не удалось установить acme.sh. Self-signed сертификат останется вариантом."
+            return 1
+        fi
+    fi
+
+    read -rp "E-mail для регистрации в ZeroSSL: " EMAIL
+    EMAIL="${EMAIL:-}"
+    if [ -z "$EMAIL" ]; then
+        warn "E-mail не указан — ZeroSSL недоступен."
+        return 1
+    fi
+
+    warn "ZeroSSL использует HTTP-01 проверку — нужен открытый порт 80."
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow 80/tcp >/dev/null 2>&1 && ok "Порт 80 временно открыт в ufw."
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1 && ok "Порт 80 временно открыт в firewalld."
+    fi
+
+    mkdir -p "$CERT_DIR"
+    "$ACME_SH" --set-default-ca --server zerossl >/dev/null 2>&1
+    "$ACME_SH" --register-account -m "$EMAIL" >/dev/null 2>&1 || true
+    ok "Выпускаем ZeroSSL сертификат для ${ADDR}..."
+    if "$ACME_SH" --issue -d "$ADDR" --standalone --httpport 80 --server zerossl --force; then
+        "$ACME_SH" --installcert --force -d "$ADDR" \
+            --key-file "$CERT_DIR/privkey.pem" \
+            --fullchain-file "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 || true
+        if [ -f "$CERT_DIR/fullchain.pem" ] && [ -f "$CERT_DIR/privkey.pem" ]; then
+            chmod 600 "$CERT_DIR/privkey.pem"
+            chmod 644 "$CERT_DIR/fullchain.pem"
+            ok "ZeroSSL сертификат выпущен."
+            apply_cert_to_panel "$CERT_DIR/fullchain.pem" "$CERT_DIR/privkey.pem"
+        else
+            err "Файлы сертификата ZeroSSL не найдены после установки."
+            return 1
+        fi
+    else
+        err "Не удалось выпустить ZeroSSL сертификат (возможно, лимит или закрытый порт 80)."
+        return 1
+    fi
+}
+
+# Меню выбора альтернативного сертификата (при ошибке у официального установщика)
+offer_alt_cert() {
+    echo
+    echo "═══════════════════════════════════════════════"
+    echo "  Выпуск альтернативного сертификата"
+    echo "═══════════════════════════════════════════════"
+    echo "  1) ZeroSSL — валидный бесплатный сертификат (нужен e-mail, порт 80)"
+    echo "  2) Self-signed — openssl SAN=IP, работает всегда"
+    echo "  3) Пропустить — оставить как есть"
+    read -rp "Ваш выбор [1-3] (по умолчанию 2): " C
+    case "${C:-2}" in
+        1)
+            if issue_zerossl_cert; then
+                ok "Альтернативный сертификат установлен."
+            else
+                warn "ZeroSSL не удался. Попробуем self-signed."
+                issue_selfsigned_cert
+            fi
+            ;;
+        2)
+            issue_selfsigned_cert
+            ;;
+        3)
+            warn "Пропускаем. Повторить попытку выпуска позже можно через меню: x-ui"
+            ;;
+        *)
+            warn "Неверный выбор, используем self-signed."
+            issue_selfsigned_cert
+            ;;
+    esac
+}
+
+# Проверка лога установщика на ошибку выпуска сертификата
+check_cert_issue() {
+    local CLEAN
+
+    if [ ! -s "$XUI_INSTALL_LOG" ]; then
+        warn "Лог установщика (${XUI_INSTALL_LOG}) отсутствует — проверка сертификата пропущена."
+        return 0
+    fi
+
+    CLEAN=$(sed -r 's/\x1b\[[0-9;]*m//g' "$XUI_INSTALL_LOG")
+    if printf '%s\n' "$CLEAN" | grep -Eqi \
+        'Failed to issue (IP )?certificate|too many certificates|too many failed authorizations|rate.?limited|rateLimit|urn:ietf:params:acme:error|Error creating new order|Register account Error'; then
+        warn "Обнаружена ошибка при выпуске сертификата официальным установщиком."
+        warn "Скорее всего превышен лимит выпуска Let's Encrypt (или закрыт порт 80)."
+        offer_alt_cert
+    else
+        ok "Сертификат выпущен без ошибок (или выпуск не запрашивался)."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+#  Резервная копия сертификатов в ~/cer-backup
+# -----------------------------------------------------------------------------
+backup_certs() {
+    local SRC="/root/cert"
+    local DST="${HOME}/cer-backup"
+
+    if [ -d "$SRC" ] && [ -n "$(ls -A "$SRC" 2>/dev/null)" ]; then
+        mkdir -p "$DST"
+        cp -r "$SRC/." "$DST/"
+        ok "Сертификаты скопированы в ${DST}"
+    else
+        warn "Каталог сертификатов (${SRC}) пуст или отсутствует — копировать нечего."
+    fi
+}
+
+# -----------------------------------------------------------------------------
 #  Загрузка реальной конфигурации панели (порт, путь, токен, учётные данные)
 # -----------------------------------------------------------------------------
 load_panel_config() {
@@ -452,6 +609,7 @@ main() {
 
     detect_ip
     install_3xui
+    check_cert_issue
     load_panel_config
     choose_proxy
 
@@ -466,11 +624,13 @@ main() {
             setup_caddy
             ;;
         none)
+            detect_panel_proto
             ok "Прокси не выбран — панель работает напрямую."
             ;;
     esac
 
     setup_firewall
+    backup_certs
     setup_selinux
     print_summary
 }
