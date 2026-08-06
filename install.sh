@@ -536,6 +536,29 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+#  Подготовка сертификатов для caddy
+#
+#  caddy запускается от пользователя caddy и не может читать каталог /root
+#  (права 700), поэтому сертификаты из /root/cert копируются в /etc/caddy/certs
+#  с владельцем caddy:caddy.
+# -----------------------------------------------------------------------------
+prepare_caddy_certs() {
+    if [ -z "$PANEL_CERT" ] || [ -z "$PANEL_KEY" ]; then
+        return
+    fi
+    local CERTS_DIR="/etc/caddy/certs"
+    mkdir -p "$CERTS_DIR"
+    cp "$PANEL_CERT" "$CERTS_DIR/fullchain.pem"
+    cp "$PANEL_KEY" "$CERTS_DIR/privkey.pem"
+    chown -R caddy:caddy "$CERTS_DIR"
+    chmod 644 "$CERTS_DIR/fullchain.pem"
+    chmod 600 "$CERTS_DIR/privkey.pem"
+    PANEL_CERT="$CERTS_DIR/fullchain.pem"
+    PANEL_KEY="$CERTS_DIR/privkey.pem"
+    ok "Сертификаты скопированы для caddy: ${CERTS_DIR}/"
+}
+
+# -----------------------------------------------------------------------------
 #  Настройка caddy как reverse proxy
 # -----------------------------------------------------------------------------
 setup_caddy() {
@@ -558,6 +581,7 @@ setup_caddy() {
         # TLS на прокси, если найден сертификат панели (Secure-cookie при https)
         if [ -n "$PANEL_CERT" ] && [ -n "$PANEL_KEY" ]; then
             PROXY_SCHEME="https"
+            prepare_caddy_certs
             cat > /etc/caddy/Caddyfile <<EOF
 :${PROXY_PORT} {
     tls ${PANEL_CERT} ${PANEL_KEY}
@@ -619,7 +643,9 @@ setup_firewall() {
         done
         # закрываем порт панели, если правило осталось от прошлой установки
         if [ -n "$CLOSE" ]; then
+            # ufw может хранить правило и с протоколом, и без него
             ufw delete allow "${CLOSE}"/tcp >/dev/null 2>&1 || true
+            ufw delete allow "${CLOSE}" >/dev/null 2>&1 || true
         fi
         ok "ufw: открыт порт ${PORTS}/tcp; прямой доступ к панели (${CLOSE:-—}/tcp) закрыт."
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
