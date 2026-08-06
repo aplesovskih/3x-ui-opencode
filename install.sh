@@ -16,9 +16,9 @@ set -u
 # -----------------------------------------------------------------------------
 #  Переменные
 # -----------------------------------------------------------------------------
-PANEL_PORT="2053"                     # порт веб-панели 3x-ui
+PANEL_PORT=""                        # порт веб-панели 3x-ui (определяется автоматически)
 PANEL_PROTO="http"                    # протокол панели (http/https), определяется автоматически
-PROXY_PORT="8080"                     # порт прокси
+PROXY_PORT="8443"                     # порт прокси
 PROXY="none"                          # выбранный прокси: nginx / caddy / none
 IP=""                                 # публичный IP сервера
 PKG_MANAGER="apt-get"                 # менеджер пакетов
@@ -141,12 +141,77 @@ install_3xui() {
 }
 
 # -----------------------------------------------------------------------------
-#  Запрос порта панели и определение её протокола
+#  Загрузка реальной конфигурации панели (порт, путь, токен, учётные данные)
 # -----------------------------------------------------------------------------
-ask_panel_port() {
-    read -rp "Порт веб-панели 3x-ui (по умолчанию ${PANEL_PORT}): " P
-    PANEL_PORT="${P:-${PANEL_PORT}}"
+load_panel_config() {
+    local XUI_BIN="/usr/local/x-ui/x-ui"
+    local CLEAN
+    local V
+
+    log "Определяем конфигурацию панели 3x-ui..."
+
+    # Очищаем лог установщика от ANSI-кодов (для парсинга текстовых полей)
+    CLEAN=""
+    if [ -s "$XUI_INSTALL_LOG" ]; then
+        CLEAN=$(sed -r 's/\x1b\[[0-9;]*m//g' "$XUI_INSTALL_LOG")
+    fi
+
+    # Порт панели: из настроек x-ui, fallback — из лога установщика
+    V=""
+    if [ -x "$XUI_BIN" ]; then
+        V=$("$XUI_BIN" setting -show true 2>/dev/null | grep -Eo 'port: [0-9]+' | awk '{print $2}' | head -1)
+    fi
+    if [ -z "$V" ] && [ -n "$CLEAN" ]; then
+        V=$(printf '%s\n' "$CLEAN" | grep -Eo 'Port:[[:space:]]*[0-9]+' | grep -Eo '[0-9]+' | head -1)
+    fi
+    if [ -n "$V" ] && [[ "$V" =~ ^[0-9]+$ ]] && [ "$V" -ge 1 ] && [ "$V" -le 65535 ]; then
+        PANEL_PORT="$V"
+    else
+        err "Не удалось определить порт панели 3x-ui."
+        err "Укажите порт вручную: x-ui setting -port <порт>."
+        exit 1
+    fi
+    ok "Порт панели 3x-ui: ${PANEL_PORT}"
+
+    # Базовый путь панели
+    V=""
+    if [ -x "$XUI_BIN" ]; then
+        V=$("$XUI_BIN" setting -show true 2>/dev/null | grep -Eo 'webBasePath: .+' | awk '{print $2}' | head -1)
+    fi
+    if [ -z "$V" ] && [ -n "$CLEAN" ]; then
+        V=$(printf '%s\n' "$CLEAN" | grep -Eo 'WebBasePath:[[:space:]]*[^[:space:]]+' | awk '{print $2}' | head -1)
+    fi
+    PANEL_PATH="${V:-}"
+
+    # API-токен
+    V=""
+    if [ -x "$XUI_BIN" ]; then
+        V=$("$XUI_BIN" setting -getApiToken true 2>/dev/null | grep -Eo 'apiToken: .+' | awk '{print $2}' | head -1)
+    fi
+    if [ -z "$V" ] && [ -n "$CLEAN" ]; then
+        V=$(printf '%s\n' "$CLEAN" | grep -Eo 'API Token:[[:space:]]*[^[:space:]]+' | sed -E 's/^API Token:[[:space:]]*//' | head -1)
+    fi
+    PANEL_TOKEN="${V:-}"
+
+    # Имя пользователя и пароль — только из лога установщика
+    if [ -n "$CLEAN" ]; then
+        PANEL_USERNAME=$(printf '%s\n' "$CLEAN" | grep -Eo 'Username:[[:space:]]*[^[:space:]]+' | awk '{print $2}' | head -1)
+        PANEL_PASSWORD=$(printf '%s\n' "$CLEAN" | grep -Eo 'Password:[[:space:]]*[^[:space:]]+' | awk '{print $2}' | head -1)
+    fi
+
+    if [ -z "$PANEL_USERNAME" ] || [ -z "$PANEL_PASSWORD" ]; then
+        warn "Имя пользователя/пароль не найдены в логе установщика (${XUI_INSTALL_LOG})."
+        warn "Сменить учётные данные: x-ui setting -username <логин> -password <пароль>."
+    fi
 }
+
+# -----------------------------------------------------------------------------
+#  Загрузка реальной конфигурации панели (порт, путь, токен, учётные данные)
+# -----------------------------------------------------------------------------
+PANEL_USERNAME=""                      # имя пользователя панели (из лога установщика)
+PANEL_PASSWORD=""                      # пароль панели (из лога установщика)
+PANEL_PATH=""                          # базовый путь панели (webBasePath)
+PANEL_TOKEN=""                         # API-токен панели
 
 detect_panel_proto() {
     log "Проверяем протокол веб-панели на 127.0.0.1:${PANEL_PORT}..."
@@ -333,6 +398,9 @@ setup_selinux() {
 #  Итоговая сводка
 # -----------------------------------------------------------------------------
 print_summary() {
+    # Нормализуем путь: убираем ведущий слэш, чтобы URL был http://IP:PORT/path
+    local PANEL_PATH_NORM="${PANEL_PATH#/}"
+
     echo
     echo "═══════════════════════════════════════════════"
     echo "   Установка завершена"
@@ -341,8 +409,8 @@ print_summary() {
         echo "   Прокси не выбран — панель работает напрямую."
     else
         echo "   Прокси:      ${PROXY}"
-        echo "   Панель:      http://${IP}:${PROXY_PORT}"
-        echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}"
+        echo "   Панель:      http://${IP}:${PROXY_PORT}/${PANEL_PATH_NORM}"
+        echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}/${PANEL_PATH_NORM}"
     fi
     echo
     echo "   Управление панелью из терминала:  x-ui"
@@ -355,13 +423,15 @@ print_summary() {
     echo "═══════════════════════════════════════════════"
     echo
     echo "═══════════════════════════════════════════════"
-    echo "   Данные, выведенные установщиком 3x-ui:"
+    echo "   Данные панели 3x-ui (из вывода установщика):"
     echo "═══════════════════════════════════════════════"
-    if [ -s "$XUI_INSTALL_LOG" ]; then
-        tail -n 40 "$XUI_INSTALL_LOG"
-    else
-        warn "Лог установщика (${XUI_INSTALL_LOG}) не найден или пуст."
-    fi
+    echo "   Username:    ${PANEL_USERNAME:-не определено}"
+    echo "   Password:    ${PANEL_PASSWORD:-не определено}"
+    echo "   Port:        ${PANEL_PORT}"
+    echo "   WebBasePath: ${PANEL_PATH_NORM:-/}"
+    echo "   Access URL:  ${PANEL_PROTO}://${IP}:${PANEL_PORT}/${PANEL_PATH_NORM}"
+    echo "   API Token:   ${PANEL_TOKEN:-не определено}"
+    echo "═══════════════════════════════════════════════"
 }
 
 # -----------------------------------------------------------------------------
@@ -382,7 +452,7 @@ main() {
 
     detect_ip
     install_3xui
-    ask_panel_port
+    load_panel_config
     choose_proxy
 
     # Настройка в зависимости от выбранного прокси
