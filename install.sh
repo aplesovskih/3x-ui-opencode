@@ -20,6 +20,7 @@ PANEL_PORT=""                        # порт веб-панели 3x-ui (оп�
 PANEL_PROTO="http"                    # протокол панели (http/https), определяется автоматически
 PANEL_CERT=""                        # путь к fullchain.pem панели (для TLS на прокси)
 PANEL_KEY=""                         # путь к privkey.pem панели
+PANEL_HOST=""                        # домен из сертификата панели (если сертификат на домен); пусто — использовать IP
 PROXY_PORT="443"                      # порт прокси
 PROXY_SCHEME="http"                   # внешний протокол прокси (http/https)
 PROXY="none"                          # выбранный прокси: nginx / caddy / none
@@ -389,10 +390,11 @@ detect_panel_proto() {
 detect_panel_cert() {
     PANEL_CERT=""
     PANEL_KEY=""
-    local d
+    PANEL_HOST=""
+    local d san dns
 
     # Каталоги сертификатов официального установщика 3x-ui:
-    #   /root/cert/ip        — самоподписанный сертификат по IP;
+    #   /root/cert/ip        — сертификат по IP (Let's Encrypt shortlived / self-signed);
     #   /root/cert/<домен>   — сертификат для домена (Let's Encrypt).
     for d in /root/cert/ip /root/cert/*; do
         [ -d "$d" ] || continue
@@ -400,6 +402,19 @@ detect_panel_cert() {
             PANEL_CERT="$d/fullchain.pem"
             PANEL_KEY="$d/privkey.pem"
             ok "Сертификат панели найден: ${PANEL_CERT}"
+
+            # Определяем, на что выпущен сертификат: домен или IP.
+            # Приоритет — SAN сертификата (надёжнее имени каталога).
+            san="$(openssl x509 -in "$PANEL_CERT" -noout -ext subjectAltName 2>/dev/null)"
+            dns="$(printf '%s\n' "$san" | sed -n 's/.*[Dd][Nn][Ss]:\([^ ,]*\).*/\1/p' | head -n1)"
+            if [ -n "$dns" ]; then
+                PANEL_HOST="$dns"
+            elif [ "$(basename "$d")" != "ip" ]; then
+                PANEL_HOST="$(basename "$d")"
+            fi
+            if [ -n "$PANEL_HOST" ]; then
+                ok "Сертификат выпущен на домен: ${PANEL_HOST}"
+            fi
             return 0
         fi
     done
@@ -532,7 +547,7 @@ EOF
     fi
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx
-    ok "nginx настроен: $(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT")"
+    ok "nginx настроен: $(build_url "$PROXY_SCHEME" "${PANEL_HOST:-$IP}" "$PROXY_PORT")"
 }
 
 # -----------------------------------------------------------------------------
@@ -618,7 +633,7 @@ EOF
         journalctl -u caddy -n 20 --no-pager 2>/dev/null || true
         exit 1
     fi
-    ok "caddy настроен: $(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT")"
+    ok "caddy настроен: $(build_url "$PROXY_SCHEME" "${PANEL_HOST:-$IP}" "$PROXY_PORT")"
 }
 
 # -----------------------------------------------------------------------------
@@ -708,12 +723,14 @@ build_url() {
 print_summary() {
     # Нормализуем путь: убираем ведущий слэш, чтобы URL был http://IP:PORT/path
     local PANEL_PATH_NORM="${PANEL_PATH#/}"
+    # Внешний адрес: домен из сертификата панели (если сертификат на домен), иначе IP
+    local HOST="${PANEL_HOST:-$IP}"
     # Рабочий адрес доступа: через прокси или напрямую к панели
     local ACCESS_URL
     if [ "$PROXY" = "none" ]; then
-        ACCESS_URL="$(build_url "$PANEL_PROTO" "$IP" "$PANEL_PORT" "$PANEL_PATH_NORM")"
+        ACCESS_URL="$(build_url "$PANEL_PROTO" "$HOST" "$PANEL_PORT" "$PANEL_PATH_NORM")"
     else
-        ACCESS_URL="$(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT" "$PANEL_PATH_NORM")"
+        ACCESS_URL="$(build_url "$PROXY_SCHEME" "$HOST" "$PROXY_PORT" "$PANEL_PATH_NORM")"
     fi
 
     echo
@@ -724,7 +741,7 @@ print_summary() {
         echo "   Прокси не выбран — панель работает напрямую."
     else
         echo "   Прокси:      ${PROXY}"
-        echo "   Панель:      $(build_url "$PROXY_SCHEME" "$IP" "$PROXY_PORT" "$PANEL_PATH_NORM")"
+        echo "   Панель:      $(build_url "$PROXY_SCHEME" "$HOST" "$PROXY_PORT" "$PANEL_PATH_NORM")"
         echo "   Внутренний:  ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}/${PANEL_PATH_NORM}"
         echo "   Прямой доступ к панели закрыт — только порт прокси."
     fi
