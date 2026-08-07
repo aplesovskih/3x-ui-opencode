@@ -4,7 +4,7 @@
 #
 #  Возможности:
 #   - установка 3x-ui официальным установщиком;
-#   - выбор и настройка прокси-сервера: nginx / caddy / без прокси;
+#   - выбор и настройка прокси-сервера: nginx / без прокси;
 #   - настройка firewall.
 #
 #  Запуск с GitHub:
@@ -23,10 +23,9 @@ PANEL_KEY=""                         # путь к privkey.pem панели
 PANEL_HOST=""                        # домен из сертификата панели (если сертификат на домен); пусто — использовать IP
 PROXY_PORT="443"                      # порт прокси
 PROXY_SCHEME="http"                   # внешний протокол прокси (http/https)
-PROXY="none"                          # выбранный прокси: nginx / caddy / none
+PROXY="none"                          # выбранный прокси: nginx / none
 IP=""                                 # публичный IP сервера
 PKG_MANAGER="apt-get"                 # менеджер пакетов
-OS_FAMILY="debian"                    # семейство ОС: debian / rhel
 XUI_INSTALL_LOG="/var/log/3x-ui-install.log"   # лог вывода официального установщика
 
 # Цвета для вывода
@@ -64,11 +63,9 @@ detect_os() {
         case "$ID" in
             ubuntu|debian|linuxmint)
                 PKG_MANAGER="apt-get"
-                OS_FAMILY="debian"
                 ;;
             centos|rocky|almalinux|rhel|fedora|ol)
                 PKG_MANAGER="dnf"
-                OS_FAMILY="rhel"
                 if [ "$ID" = "centos" ] && [ "${VERSION_ID%%.*}" -lt 8 ]; then
                     PKG_MANAGER="yum"
                 fi
@@ -464,13 +461,11 @@ choose_proxy() {
     echo "  Выбор прокси-сервера"
     echo "═══════════════════════════════════════════════"
     echo "  1) nginx"
-    echo "  2) caddy"
-    echo "  3) без прокси (панель напрямую)"
-    read -rp "Ваш выбор [1-3] (по умолчанию 1): " C
+    echo "  2) без прокси (панель напрямую)"
+    read -rp "Ваш выбор [1-2] (по умолчанию 1): " C
     case "${C:-1}" in
         1) PROXY="nginx" ;;
-        2) PROXY="caddy" ;;
-        3) PROXY="none" ;;
+        2) PROXY="none" ;;
         *) warn "Неверный выбор, используем nginx."; PROXY="nginx" ;;
     esac
 
@@ -548,92 +543,6 @@ EOF
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx
     ok "nginx настроен: $(build_url "$PROXY_SCHEME" "${PANEL_HOST:-$IP}" "$PROXY_PORT")"
-}
-
-# -----------------------------------------------------------------------------
-#  Подготовка сертификатов для caddy
-#
-#  caddy запускается от пользователя caddy и не может читать каталог /root
-#  (права 700), поэтому сертификаты из /root/cert копируются в /etc/caddy/certs
-#  с владельцем caddy:caddy.
-# -----------------------------------------------------------------------------
-prepare_caddy_certs() {
-    if [ -z "$PANEL_CERT" ] || [ -z "$PANEL_KEY" ]; then
-        return
-    fi
-    local CERTS_DIR="/etc/caddy/certs"
-    mkdir -p "$CERTS_DIR"
-    cp "$PANEL_CERT" "$CERTS_DIR/fullchain.pem"
-    cp "$PANEL_KEY" "$CERTS_DIR/privkey.pem"
-    chown -R caddy:caddy "$CERTS_DIR"
-    chmod 644 "$CERTS_DIR/fullchain.pem"
-    chmod 600 "$CERTS_DIR/privkey.pem"
-    PANEL_CERT="$CERTS_DIR/fullchain.pem"
-    PANEL_KEY="$CERTS_DIR/privkey.pem"
-    ok "Сертификаты скопированы для caddy: ${CERTS_DIR}/"
-}
-
-# -----------------------------------------------------------------------------
-#  Настройка caddy как reverse proxy
-# -----------------------------------------------------------------------------
-setup_caddy() {
-    log "Устанавливаем caddy..."
-    if [ "$OS_FAMILY" = "debian" ]; then
-        install_pkg debian-keyring debian-archive-keyring apt-transport-https curl
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-            | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq caddy >/dev/null 2>&1 || apt-get install -y caddy
-    else
-        curl -fsSL -o /etc/yum.repos.d/caddy.repo \
-            'https://dl.cloudsmith.io/public/caddy/stable/cfg/rpm.repo.txt'
-        dnf install -y -q caddy >/dev/null 2>&1 || dnf install -y caddy
-    fi
-
-    if [ "$PANEL_PROTO" = "https" ]; then
-        # TLS на прокси, если найден сертификат панели (Secure-cookie при https)
-        if [ -n "$PANEL_CERT" ] && [ -n "$PANEL_KEY" ]; then
-            PROXY_SCHEME="https"
-            prepare_caddy_certs
-            cat > /etc/caddy/Caddyfile <<EOF
-:${PROXY_PORT} {
-    tls ${PANEL_CERT} ${PANEL_KEY}
-    reverse_proxy https://127.0.0.1:${PANEL_PORT} {
-        transport http {
-            tls_insecure_skip_verify
-        }
-    }
-}
-EOF
-        else
-            warn "Панель на HTTPS, сертификат не найден — прокси работает без TLS, вход в панель может давать 403."
-            cat > /etc/caddy/Caddyfile <<EOF
-:${PROXY_PORT} {
-    reverse_proxy https://127.0.0.1:${PANEL_PORT} {
-        transport http {
-            tls_insecure_skip_verify
-        }
-    }
-}
-EOF
-        fi
-    else
-        cat > /etc/caddy/Caddyfile <<EOF
-:${PROXY_PORT} {
-    reverse_proxy http://127.0.0.1:${PANEL_PORT}
-}
-EOF
-    fi
-
-    systemctl enable caddy >/dev/null 2>&1 || true
-    if ! systemctl restart caddy; then
-        err "Не удалось запустить caddy. Последние строки лога:"
-        journalctl -u caddy -n 20 --no-pager 2>/dev/null || true
-        exit 1
-    fi
-    ok "caddy настроен: $(build_url "$PROXY_SCHEME" "${PANEL_HOST:-$IP}" "$PROXY_PORT")"
 }
 
 # -----------------------------------------------------------------------------
@@ -750,8 +659,6 @@ print_summary() {
     echo "   Статус службы:                    systemctl status x-ui"
     if [ "$PROXY" = "nginx" ]; then
         echo "   Статус nginx:                     systemctl status nginx"
-    elif [ "$PROXY" = "caddy" ]; then
-        echo "   Статус caddy:                     systemctl status caddy"
     fi
     echo "═══════════════════════════════════════════════"
     echo
@@ -775,7 +682,7 @@ main() {
 
     echo "═══════════════════════════════════════════════"
     echo "  Установка панели 3x-ui"
-    echo "  Выбор прокси: nginx / caddy / без прокси"
+    echo "  Выбор прокси: nginx / без прокси"
     echo "═══════════════════════════════════════════════"
 
     detect_os
@@ -794,10 +701,6 @@ main() {
         nginx)
             detect_panel_proto
             setup_nginx
-            ;;
-        caddy)
-            detect_panel_proto
-            setup_caddy
             ;;
         none)
             detect_panel_proto
