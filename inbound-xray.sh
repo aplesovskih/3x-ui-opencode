@@ -1623,6 +1623,7 @@ create_channel() {
     CLIENT_PRIV=""; CLIENT_PUB=""; CLIENT_SECRET=""
     ACCOUNT_USER=""; ACCOUNT_PASS=""
     INBOUND_ID=""; WS_PATH=""; WS_HOST=""; SNI=""; LISTEN=""
+    SS_METHOD=""
     REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""; REALITY_SNI=""
 
     menu_protocol
