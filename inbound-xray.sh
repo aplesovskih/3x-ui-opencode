@@ -13,7 +13,9 @@
 #   * заглушка-сайт на корневом адресе (панель скрывается на своём пути);
 #   * подписка пользователя (/sub/) через внешний адрес с корректными ссылками
 #     (записи в таблице hosts для каналов за прокси);
-#   * открытие прямых (непроксируемых) портов каналов в firewall.
+#   * открытие прямых (непроксируемых) портов каналов в firewall;
+#   * автопроверка зависимостей (sqlite3, openssl, curl; опционально nginx):
+#     при отсутствии — вопрос «установить или выйти».
 #
 # Запись в конфигурацию панели выполняется напрямую в базу данных
 # (sqlite3) с последующим перезапуском x-ui — без REST API.
@@ -21,7 +23,7 @@
 # *** ВАЖНО: поддержка панели 3x-ui v3.6+ (формат базы данных). ***
 # На более старых версиях панели схема таблиц отличается — не работает.
 #
-# Использование:  sudo bash inbound-xray.sh
+# Использование:  bash inbound-xray.sh
 # Переменные окружения:
 #   XUI_DB  — путь к базе панели (по умолчанию /etc/x-ui/x-ui.db)
 #   XUI_XRAY — путь к бинарнику xray (по умолчанию /usr/local/x-ui/bin/xray)
@@ -139,14 +141,67 @@ require_root() {
     [[ "$(id -u)" -eq 0 ]] || die "Скрипт нужно запускать от root (sudo)."
 }
 
-require_tools() {
-    local missing=()
-    for t in sqlite3 openssl curl; do
+# detect_os — определяет пакетный менеджер системы (apt-get/dnf/yum).
+detect_os() {
+    PKG_MANAGER=""
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case "$ID" in
+            ubuntu|debian|linuxmint)                PKG_MANAGER="apt-get" ;;
+            centos|rocky|almalinux|rhel|fedora|ol)
+                PKG_MANAGER="dnf"
+                if [[ "$ID" == "centos" && "${VERSION_ID%%.*}" -lt 8 ]]; then
+                    PKG_MANAGER="yum"
+                fi
+                ;;
+        esac
+    fi
+    [[ -n "$PKG_MANAGER" ]] || die "Не удалось определить менеджер пакетов — установка невозможна. Установите зависимости вручную и повторите."
+    log "Менеджер пакетов: $PKG_MANAGER"
+}
+
+# install_pkg <пакеты...> — установка через системный менеджер пакетов.
+install_pkg() {
+    case "$PKG_MANAGER" in
+        apt-get)
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq "$@" >/dev/null 2>&1 || apt-get install -y "$@"
+            ;;
+        dnf)
+            dnf install -y -q "$@" >/dev/null 2>&1 || dnf install -y "$@"
+            ;;
+        yum)
+            yum install -y -q "$@" >/dev/null 2>&1 || yum install -y "$@"
+            ;;
+    esac
+}
+
+# ensure_tools <пакеты...> — проверяет наличие программ; при отсутствии
+# спрашивает «установить или выйти» и при согласии устанавливает.
+ensure_tools() {
+    local missing=() t
+    for t in "$@"; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
-    if ((${#missing[@]} > 0)); then
-        die "Отсутствуют необходимые программы: ${missing[*]}. Установите их и повторите."
+    ((${#missing[@]} > 0)) || return 0
+    if ! confirm "Отсутствуют программы: ${missing[*]}. Установить их?" "y"; then
+        die "Отменено пользователем. Установите отсутствующие программы вручную и повторите."
     fi
+    info "Устанавливаем: ${missing[*]}..."
+    install_pkg "${missing[@]}"
+    local still=()
+    for t in "${missing[@]}"; do
+        command -v "$t" >/dev/null 2>&1 || still+=("$t")
+    done
+    if ((${#still[@]} > 0)); then
+        die "Не удалось установить: ${still[*]}. Установите их вручную и повторите."
+    fi
+    ok "Установлено: ${missing[*]}"
+}
+
+require_tools() {
+    ensure_tools sqlite3 openssl curl
 }
 
 require_panel() {
@@ -1386,15 +1441,9 @@ setup_landing() {
     # nginx обязателен
     if ! command -v nginx >/dev/null 2>&1; then
         if confirm "nginx не установлен. Установить и настроить прокси панели?"; then
-            log "Устанавливаем nginx..."
-            if command -v apt-get >/dev/null 2>&1; then
-                apt-get update -qq >/dev/null 2>&1 || true
-                apt-get install -y -qq nginx >/dev/null 2>&1 || apt-get install -y nginx
-            elif command -v dnf >/dev/null 2>&1; then
-                dnf install -y -q nginx >/dev/null 2>&1 || dnf install -y nginx
-            else
-                die "Не удалось установить nginx: нет apt-get/dnf."
-            fi
+            info "Устанавливаем nginx..."
+            install_pkg nginx || die "Не удалось установить nginx."
+            command -v nginx >/dev/null 2>&1 || die "nginx не установился."
             systemctl enable nginx >/dev/null 2>&1 || true
         else
             warn "Заглушка требует nginx. Отмена."
@@ -1634,7 +1683,24 @@ create_channel() {
     fi
 
     # nginx-интеграция
+    # nginx-интеграция
     USE_NGINX=""
+    local can_proxy=""
+    case "$TRANSPORT" in
+        ws|grpc|xhttp|httpupgrade) can_proxy=1 ;;
+        tcp)
+            [[ "$PROTOCOL" != "mtproto" && ( "$SECURITY" == "reality" || "$SECURITY" == "tls" ) ]] && can_proxy=1
+            ;;
+    esac
+    # Если nginx не установлен — предложить установить и использовать прокси
+    if [[ -n "$can_proxy" ]] && ! command -v nginx >/dev/null 2>&1; then
+        if confirm "nginx не установлен. Установить и использовать прокси для канала?"; then
+            info "Устанавливаем nginx..."
+            install_pkg nginx || die "Не удалось установить nginx."
+            command -v nginx >/dev/null 2>&1 || die "nginx не установился."
+            systemctl enable nginx >/dev/null 2>&1 || true
+        fi
+    fi
     if command -v nginx >/dev/null 2>&1; then
         case "$TRANSPORT" in
             ws|grpc|xhttp|httpupgrade)
@@ -1719,6 +1785,7 @@ main() {
     banner "Поддержка панели 3x-ui v3.6+ (формат базы данных)."
     banner ""
     require_root
+    detect_os
     require_tools
     load_panel_env
 

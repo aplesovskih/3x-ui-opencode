@@ -68,8 +68,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/aplesovskih/3x-ui-opencode/m
 Дополнительный скрипт для создания каналов (inbound) поверх уже установленной панели:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/aplesovskih/3x-ui-opencode/main/inbound-xray.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/aplesovskih/3x-ui-opencode/main/inbound-xray.sh)
 ```
+
+> Запуск от `root` (скрипт пишет в базу панели `/etc/x-ui/x-ui.db` и перезапускает `x-ui`). Если вошли под обычным пользователем — сначала `su -`; `sudo` внутри команды не используется. Отсутствующие зависимости (sqlite3, openssl, curl) скрипт предложит установить.
 
 - **⚠️ Важно: поддержка панели 3x-ui v3.6+ (формат базы данных).** На более старых версиях панели схема таблиц отличается — скрипт не работает.
 - Скрипт работает как главное меню: создание канала, включение/отключение заглушки, включение подписки.
