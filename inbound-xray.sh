@@ -41,6 +41,7 @@ PANEL_INSTALL_LOG="/var/log/3x-ui-install.log"   # лог официальног
 NGINX_SNIPPET="/etc/nginx/snippets/includes.conf"
 NGINX_STREAM="/etc/nginx/stream-enabled/stream.conf"
 NGINX_CONF="/etc/nginx/conf.d/x-ui.conf"
+NGINX_MAIN="/etc/nginx/nginx.conf"
 # 1 = всё внешнее трафик (http + stream) уже переведено на единый 443
 STREAM_443_MASTER=""
 # Внутренний https-порт nginx (панель + WS/gRPC), внешний слушает stream-мастер
@@ -63,6 +64,7 @@ PANEL_TOKEN=""
 PANEL_USERNAME=""
 PANEL_PASSWORD=""
 SUB_PORT=""
+SUB_PATH="/sub/"
 SUB_ENABLE="false"
 
 # Внешний адрес/порт прокси (nginx) — заполняются при определении окружения
@@ -319,9 +321,11 @@ load_panel_env() {
         fi
     fi
 
-    # Подписка: суб-порт и включение из БД панели
+    # Подписка: суб-порт, путь и включение из БД панели
     SUB_PORT="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subPort' LIMIT 1;" 2>/dev/null || true)"
     [[ -z "$SUB_PORT" ]] && SUB_PORT="2096"
+    SUB_PATH="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subPath' LIMIT 1;" 2>/dev/null || true)"
+    [[ -z "$SUB_PATH" ]] && SUB_PATH="/sub/"
     local sub_enable=""
     sub_enable="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subEnable' LIMIT 1;" 2>/dev/null || true)"
     [[ "$sub_enable" == "true" ]] && SUB_ENABLE="true"
@@ -1024,7 +1028,7 @@ INSERT INTO inbounds
 VALUES
   (1, 0, 0, 0, '$(sql_escape "$REMARK")', 1, 0, 'never',
    0, '$(sql_escape "$LISTEN")', $PORT, '$PROTOCOL', '$(sql_escape "$settings")', '$(sql_escape "$stream")',
-   '$tag', '$(sql_escape "$snf")', 1, NULL, 'node', '',
+   '$(sql_escape "$tag")', '$(sql_escape "$snf")', 1, NULL, 'custom', '$(sql_escape "$(external_addr)")',
    '', 1${time_vals});
 SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в базу."
 }
@@ -1517,6 +1521,53 @@ MENU
 # nginx-интеграция
 # =============================================================================
 
+# nginx_ensure_files — создаёт каталоги и пустые файлы сниппета и stream,
+# если их ещё нет. Без этого скрипт молча пропускал настройку прокси.
+nginx_ensure_files() {
+    local dir_snip dir_stream
+    dir_snip="$(dirname "$NGINX_SNIPPET")"
+    dir_stream="$(dirname "$NGINX_STREAM")"
+    mkdir -p "$dir_snip" "$dir_stream" || { warn "Не удалось создать каталоги nginx ($dir_snip, $dir_stream)."; return 1; }
+    [[ -f "$NGINX_SNIPPET" ]] || { touch "$NGINX_SNIPPET" || return 1; }
+    [[ -f "$NGINX_STREAM" ]] || { touch "$NGINX_STREAM" || return 1; }
+    [[ -s "$NGINX_SNIPPET" ]] || printf '%s\n' "# inbound-xray.sh: WS/gRPC/XHTTP regex-location'ы" > "$NGINX_SNIPPET"
+    [[ -s "$NGINX_STREAM" ]] || printf '%s\n' "# inbound-xray.sh: stream-правила (passthrough / stream-мастер)" > "$NGINX_STREAM"
+}
+
+# nginx_stream_context_enable — подключает stream-контекст в nginx.conf:
+# блок "stream { include .../stream-enabled/*.conf; }" на верхнем уровне.
+# С бэкапом и откатом при ошибке nginx -t.
+nginx_stream_context_enable() {
+    local nf="$NGINX_MAIN"
+    local dir_stream
+    dir_stream="$(dirname "$NGINX_STREAM")"
+    [[ -f "$nf" ]] || { warn "Не найден $nf — stream-контекст не подключён."; return 1; }
+    if grep -Eqs 'stream\s*\{' "$nf"; then
+        if ! grep -Eqs 'stream-enabled/\*\.conf' "$nf"; then
+            warn "$nf: stream-блок уже есть, но include stream-enabled/*.conf не найден."
+        fi
+        return 0
+    fi
+    local bak
+    bak="$(mktemp)"
+    cp -a "$nf" "$bak" || return 1
+    {
+        printf '\n'
+        printf '%s\n' "# inbound-xray.sh: stream-контекст (REALITY/TLS passthrough и stream-мастер)"
+        printf '%s\n' 'stream {'
+        printf '    include %s/*.conf;\n' "$dir_stream"
+        printf '%s\n' '}'
+    } >> "$nf"
+    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+        warn "nginx -t не прошёл — откат nginx.conf."
+        cp -a "$bak" "$nf"
+        rm -f "$bak"
+        return 1
+    fi
+    rm -f "$bak"
+    ok "stream-контекст подключён в $nf"
+}
+
 # nginx_add_http_location — универсальный location для WS/gRPC/XHTTP/HTTPUpgrade.
 nginx_add_http_location() {
     [[ -f "$NGINX_SNIPPET" ]] || return 0
@@ -1727,6 +1778,8 @@ EOF
 # nginx_stream_master_setup — включает режим stream-мастера на 443.
 nginx_stream_master_setup() {
     command -v nginx >/dev/null 2>&1 || die "nginx не установлен — stream-мастер невозможен."
+    nginx_ensure_files || die "Не удалось подготовить файлы nginx."
+    nginx_stream_context_enable || die "Не удалось подключить stream-контекст."
     stream_ssl_preread_ok || die "В nginx нет модуля stream_ssl_preread (нужен nginx-full/extra)."
     if port_in_use "${STREAM_MASTER_PORT:-443}" tcp && ! is_stream_443_master; then
         warn "Порт ${STREAM_MASTER_PORT:-443} занят другим процессом."
@@ -2016,7 +2069,10 @@ write_panel_conf() {
 
     local sub_loc=""
     if [[ "$SUB_ENABLE" == "true" && -n "$SUB_PORT" ]]; then
-        sub_loc="    location /sub/ {
+        local sub_loc_path="${SUB_PATH:-/sub/}"
+        [[ "$sub_loc_path" == /* ]] || sub_loc_path="/${sub_loc_path}"
+        [[ "$sub_loc_path" == */ ]] || sub_loc_path="${sub_loc_path}/"
+        sub_loc="    location ${sub_loc_path} {
         proxy_pass http://127.0.0.1:${SUB_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -2076,11 +2132,10 @@ ${up_extra}
     local bak
     bak="$(mktemp)"
     [[ -f "$file" ]] && cp -a "$file" "$bak"
+    mkdir -p "$(dirname "$file")" || { warn "Не удалось создать каталог $(dirname "$file")."; return 1; }
     # WS/gRPC regex-location'ы живут в общем сниппете — подключаем его в server
-    local snippet_line=""
-    if [[ -f "$NGINX_SNIPPET" && "$NGINX_SNIPPET" != "$file" ]]; then
-        snippet_line="    include ${NGINX_SNIPPET};"
-    fi
+    nginx_ensure_files
+    local snippet_line="    include ${NGINX_SNIPPET};"
     cat > "$file" <<EOF
 server {
 ${listen_dir}
@@ -2245,10 +2300,13 @@ db_add_host_record() {
 # sub_url <subId> — URL подписки: через nginx или напрямую на суб-порт.
 sub_url() {
     local subid="$1"
+    local sub_path="${SUB_PATH:-/sub/}"
+    [[ "$sub_path" == /* ]] || sub_path="/${sub_path}"
+    [[ "$sub_path" == */ ]] || sub_path="${sub_path}/"
     if [[ -n "$NGINX_CONF" && -f "$NGINX_CONF" ]]; then
-        printf '%s/sub/%s' "$(external_url "")" "$subid"
+        printf '%s%s%s' "$(external_url "")" "$sub_path" "$subid"
     else
-        printf '%s://%s:%s/sub/%s' "$PANEL_PROTO" "$(external_addr)" "$SUB_PORT" "$subid"
+        printf '%s://%s:%s%s%s' "$PANEL_PROTO" "$(external_addr)" "$SUB_PORT" "$sub_path" "$subid"
     fi
 }
 
@@ -2258,13 +2316,20 @@ setup_subscription() {
     if [[ -n "$NGINX_CONF" && -f "$NGINX_CONF" ]]; then
         base="$(external_url "")"
         ext="$(external_addr)"
+        # TLS терминирует nginx: суб-сервер остаётся на локальном HTTP,
+        # адрес слушания — только loopback.
+        nginx_ensure_files
+        nginx_stream_context_enable
+        db_set_setting "subListen" "127.0.0.1"
+        db_set_setting "subCertFile" ""
+        db_set_setting "subKeyFile" ""
     else
         base="$PANEL_PROTO://$(external_addr)"
         ext="$(external_addr)"
     fi
     db_set_setting "subEnable" "true"
     db_set_setting "subDomain" "$ext"
-    db_set_setting "subURI" "$base"
+    db_set_setting "subURI" "$base${SUB_PATH:-/sub/}"
     SUB_ENABLE="true"
 
     local mode="panel"
@@ -2508,6 +2573,8 @@ create_channel() {
 
     # nginx применение
     if [[ -n "$USE_NGINX" ]]; then
+        nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
+        nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
         case "$TRANSPORT" in
             ws|grpc|xhttp|httpupgrade) nginx_add_http_location ;;
         esac
@@ -2545,6 +2612,10 @@ main() {
     detect_os
     require_tools
     load_panel_env
+    if command -v nginx >/dev/null 2>&1; then
+        nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
+        nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
+    fi
 
     while true; do
         banner ""
