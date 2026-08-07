@@ -35,7 +35,7 @@ set -euo pipefail
 XUI_DB="${XUI_DB:-/etc/x-ui/x-ui.db}"
 XUI_XRAY="${XUI_XRAY:-/usr/local/x-ui/bin/xray}"
 LOG_FILE="${XUI_LOG:-/var/log/setup-xray.log}"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 XUI_BIN="/usr/local/x-ui/x-ui"
 PANEL_INSTALL_LOG="/var/log/3x-ui-install.log"   # лог официального установщика
 NGINX_SNIPPET="/etc/nginx/snippets/includes.conf"
@@ -737,6 +737,11 @@ sniffing_json() {
     fi
 }
 
+# db_has_column <таблица> <колонка> — проверяет наличие колонки в таблице.
+db_has_column() {
+    sqlite3 "$XUI_DB" "PRAGMA table_info($1);" 2>/dev/null | awk -F'|' -v c="$2" '$2 == c { found=1 } END { exit !found }'
+}
+
 # db_insert_inbound <settings_json> <stream_json> <sniffing_json> — вставка inbound.
 # Возвращает (через переменную INBOUND_ID) новый id.
 db_insert_inbound() {
@@ -744,17 +749,24 @@ db_insert_inbound() {
     tag="inbound-${PROTOCOL}-$(gen_hex 4)"
     local now
     now="$(date +%s000)"
+    # В некоторых версиях панели таблица inbounds не имеет created_at/updated_at —
+    # вставляем их только если колонки реально существуют.
+    local time_cols="" time_vals=""
+    if db_has_column inbounds created_at; then
+        time_cols=", created_at, updated_at"
+        time_vals=", $now, $now"
+    fi
     INBOUND_ID="$(sqlite3 "$XUI_DB" "
 INSERT INTO inbounds
   (user_id, up, down, total, remark, enable, expiry_time, traffic_reset,
    last_traffic_reset_time, listen, port, protocol, settings, stream_settings,
    tag, sniffing, sub_sort_index, node_id, share_addr_strategy, share_addr,
-   origin_node_guid, traffic_reset_day, created_at, updated_at)
+   origin_node_guid, traffic_reset_day${time_cols})
 VALUES
   (1, 0, 0, 0, '$(sql_escape "$REMARK")', 1, 0, 'never',
    0, '$(sql_escape "$LISTEN")', $PORT, '$PROTOCOL', '$(sql_escape "$settings")', '$(sql_escape "$stream")',
    '$tag', '$(sql_escape "$snf")', 1, NULL, 'node', '',
-   '', 1, $now, $now);
+   '', 1${time_vals});
 SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в базу."
 }
 
@@ -773,40 +785,70 @@ db_add_client_records() {
     existing="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
         cid="$existing"
-        sqlite3 "$XUI_DB" "UPDATE clients SET
-            sub_id = '$(sql_escape "$CLIENT_SUBID")',
+        local upd
+        upd="sub_id = '$(sql_escape "$CLIENT_SUBID")',
             uuid = '$(sql_escape "$CLIENT_ID")',
             password = '$(sql_escape "$CLIENT_PW")',
             auth = '$(sql_escape "$CLIENT_AUTH")',
             flow = '$(sql_escape "$CLIENT_FLOW")',
             security = 'auto',
             limit_ip = 0, total_gb = 0, expiry_time = 0, enable = 1, tg_id = 0,
-            comment = '', reset = 0, updated_at = $now,
+            comment = '', reset = 0"
+        if db_has_column clients updated_at; then
+            upd="$upd, updated_at = $now"
+        fi
+        if db_has_column clients wg_private_key; then
+            upd="$upd,
             wg_private_key = '$(sql_escape "$wg_pk")',
             wg_public_key = '$(sql_escape "$wg_pub")',
             wg_allowed_ips = '$(sql_escape "$wg_ips")',
-            wg_pre_shared_key = '', wg_keep_alive = $wg_ka,
-            secret = '$(sql_escape "$CLIENT_SECRET")'
-          WHERE id = $cid;" || die "Ошибка обновления клиента."
+            wg_pre_shared_key = '', wg_keep_alive = $wg_ka"
+        fi
+        if db_has_column clients secret; then
+            upd="$upd, secret = '$(sql_escape "$CLIENT_SECRET")'"
+        fi
+        sqlite3 "$XUI_DB" "UPDATE clients SET $upd WHERE id = $cid;" || die "Ошибка обновления клиента."
     else
-        cid="$(sqlite3 "$XUI_DB" "INSERT INTO clients
-            (email, sub_id, uuid, password, auth, flow, security, reverse,
+        local cols vals
+        cols="email, sub_id, uuid, password, auth, flow, security, reverse,
              limit_ip, total_gb, expiry_time, enable, tg_id, group_name,
-             comment, reset, created_at, updated_at,
-             wg_private_key, wg_public_key, wg_allowed_ips, wg_pre_shared_key,
-             wg_keep_alive, secret, ad_tag)
-          VALUES
-            ('$(sql_escape "$CLIENT_EMAIL")', '$(sql_escape "$CLIENT_SUBID")', '$(sql_escape "$CLIENT_ID")',
+             comment, reset"
+        vals="('$(sql_escape "$CLIENT_EMAIL")', '$(sql_escape "$CLIENT_SUBID")', '$(sql_escape "$CLIENT_ID")',
              '$(sql_escape "$CLIENT_PW")', '$(sql_escape "$CLIENT_AUTH")', '$(sql_escape "$CLIENT_FLOW")',
              'auto', '',
              0, 0, 0, 1, 0, '',
-             '', 0, $now, $now,
-             '$(sql_escape "$wg_pk")', '$(sql_escape "$wg_pub")', '$(sql_escape "$wg_ips")', '',
-             $wg_ka, '$(sql_escape "$CLIENT_SECRET")', '');
-          SELECT last_insert_rowid();")" || die "Ошибка вставки клиента."
+             '', 0"
+        if db_has_column clients created_at; then
+            cols="$cols, created_at, updated_at"
+            vals="$vals, $now, $now"
+        fi
+        if db_has_column clients wg_private_key; then
+            cols="$cols, wg_private_key, wg_public_key, wg_allowed_ips, wg_pre_shared_key, wg_keep_alive"
+            vals="$vals, '$(sql_escape "$wg_pk")', '$(sql_escape "$wg_pub")', '$(sql_escape "$wg_ips")', '', $wg_ka"
+        fi
+        if db_has_column clients secret; then
+            cols="$cols, secret"
+            vals="$vals, '$(sql_escape "$CLIENT_SECRET")'"
+        fi
+        if db_has_column clients ad_tag; then
+            cols="$cols, ad_tag"
+            vals="$vals, ''"
+        fi
+        cid="$(sqlite3 "$XUI_DB" "INSERT INTO clients ($cols) VALUES $vals);
+            SELECT last_insert_rowid();")" || die "Ошибка вставки клиента."
     fi
-    sqlite3 "$XUI_DB" "INSERT OR IGNORE INTO client_inbounds (client_id, inbound_id, flow_override, created_at)
-        VALUES ($cid, $inbound_id, '$(sql_escape "$CLIENT_FLOW")', $now);" \
+    local ci_cols="client_id, inbound_id"
+    local ci_vals="$cid, $inbound_id"
+    if db_has_column client_inbounds flow_override; then
+        ci_cols="$ci_cols, flow_override"
+        ci_vals="$ci_vals, '$(sql_escape "$CLIENT_FLOW")'"
+    fi
+    if db_has_column client_inbounds created_at; then
+        ci_cols="$ci_cols, created_at"
+        ci_vals="$ci_vals, $now"
+    fi
+    sqlite3 "$XUI_DB" "INSERT OR IGNORE INTO client_inbounds ($ci_cols)
+        VALUES ($ci_vals);" \
         || die "Ошибка привязки клиента к inbound."
     sqlite3 "$XUI_DB" "INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset, last_online)
         VALUES ($inbound_id, 1, '$(sql_escape "$CLIENT_EMAIL")', 0, 0, 0, 0, 0, 0)
