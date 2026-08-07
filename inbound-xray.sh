@@ -41,6 +41,12 @@ PANEL_INSTALL_LOG="/var/log/3x-ui-install.log"   # лог официальног
 NGINX_SNIPPET="/etc/nginx/snippets/includes.conf"
 NGINX_STREAM="/etc/nginx/stream-enabled/stream.conf"
 NGINX_CONF="/etc/nginx/conf.d/x-ui.conf"
+# 1 = всё внешнее трафик (http + stream) уже переведено на единый 443
+STREAM_443_MASTER=""
+# Внутренний https-порт nginx (панель + WS/gRPC), внешний слушает stream-мастер
+PANEL_SSL_PORT="8443"
+# Внешний порт stream-мастера
+STREAM_MASTER_PORT="443"
 LANDING_DIR="/var/www/landing"
 LANDING_INDEX="$LANDING_DIR/index.html"
 
@@ -82,6 +88,12 @@ REALITY_SNI=""
 REALITY_TARGET=""
 REALITY_SPIDERX="/"
 REALITY_SETTINGS_JSON=""
+
+# Параметры канала с уникальным SNI (TCP+TLS) и переиспользуемого клиента
+CHANNEL_SNI=""
+CHANNEL_CERT_DIR=""
+REUSE_CLIENT=""
+EXISTING_CLIENT_ID=""
 
 # --- Цвета и вывод ------------------------------------------------------------
 if [[ -t 1 ]]; then
@@ -316,7 +328,11 @@ load_panel_env() {
 
     # Внешний порт nginx: из listen в конфиге панели
     detect_nginx_conf
-    if [[ -n "$NGINX_CONF" && -f "$NGINX_CONF" ]]; then
+    if is_stream_443_master; then
+        STREAM_443_MASTER=1
+        PROXY_PORT="${STREAM_MASTER_PORT:-443}"
+        PROXY_SCHEME="https"
+    elif [[ -n "$NGINX_CONF" && -f "$NGINX_CONF" ]]; then
         PROXY_PORT="$(grep -Eo 'listen[[:space:]]+[0-9]+' "$NGINX_CONF" | awk '{print $2}' | head -1)"
         if grep -Eqs 'listen[[:space:]]+[0-9]+[[:space:]]+ssl' "$NGINX_CONF" \
             || grep -Eqs 'listen[[:space:]]+[0-9]+[[:space:]]+[^;]*ssl' "$NGINX_CONF"; then
@@ -370,24 +386,51 @@ gen_psk() {
 
 # x25519_keypair — пара ключей REALITY/WireGuard.
 # Устанавливает X25519_PRIV, X25519_PUB.
+# ВАЖНО: вывод `xray x25519` в современных версиях (26.7.x) —
+#   "PrivateKey: <base64url>" и "Password (PublicKey): <base64url>"
+# (кодировка base64.RawURLEncoding, БЕЗ padding '=' и с алфавитом '-_').
+# Старые версии печатали "Private key:" / "Public key:". Regex по всей строке
+# не матчил современный формат → срабатывал fallback openssl со стандартным
+# base64 ('='), который Xray отвергает как invalid privateKey. Поэтому парсим
+# построчно, а fallback конвертируем в base64url.
 x25519_keypair() {
-    local out="" priv="" pub=""
-    # Предпочтение: бинарник xray (команда x25519)
+    local out="" priv="" pub="" line="" k=""
     if [[ -x "$XUI_XRAY" ]]; then
         out="$("$XUI_XRAY" x25519 2>/dev/null)" || out=""
-        if [[ -n "$out" && "$out" =~ Private[[:space:]]+key:[[:space:]]*([^[:space:]]+).*Public[[:space:]]+key:[[:space:]]*([^[:space:]]+) ]]; then
-            X25519_PRIV="${BASH_REMATCH[1]}"
-            X25519_PUB="${BASH_REMATCH[2]}"
-            return 0
+        if [[ -n "$out" ]]; then
+            while IFS= read -r line; do
+                line="${line%$'\r'}"
+                case "$line" in
+                    PrivateKey:*) k="${line#*:}" ;;
+                    "Password (PublicKey):"*) k="${line#*:}" ;;
+                    "Private key:"*) k="${line#*:}" ;;
+                    "Public key:"*)  k="${line#*:}" ;;
+                    "Private:"*)     k="${line#*:}" ;;
+                    "Public:"*)      k="${line#*:}" ;;
+                    *) continue ;;
+                esac
+                # трим пробелов
+                k="${k#"${k%%[![:space:]]*}"}"
+                k="${k%"${k##*[![:space:]]}"}"
+                case "$line" in
+                    PrivateKey:*|"Private key:"*|"Private:"*) priv="$k" ;;
+                    "Password (PublicKey):"*|"Public key:"*|"Public:"*) pub="$k" ;;
+                esac
+            done <<< "$out"
+            # 32 байта в base64url без padding = 43 символа
+            if [[ ${#priv} -eq 43 && ${#pub} -eq 43 ]]; then
+                X25519_PRIV="$priv"; X25519_PUB="$pub"
+                return 0
+            fi
         fi
     fi
-    # Fallback: openssl X25519 (raw = последние 32 байта DER)
+    # Fallback: openssl X25519 (raw = последние 32 байта DER), затем base64url.
     local tmp
     tmp="$(mktemp -d)"
     if openssl genpkey -algorithm X25519 -out "$tmp/k.pem" >/dev/null 2>&1 \
-        && priv="$(openssl pkey -in "$tmp/k.pem" -outform DER 2>/dev/null | tail -c 32 | base64 -w0 | tr -d '\n')" \
-        && pub="$(openssl pkey -in "$tmp/k.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0 | tr -d '\n')" \
-        && [[ -n "$priv" && -n "$pub" ]]; then
+        && priv="$(openssl pkey -in "$tmp/k.pem" -outform DER 2>/dev/null | tail -c 32 | base64 -w0 | tr -d '=\n\r' | tr '+/' '-_')" \
+        && pub="$(openssl pkey -in "$tmp/k.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0 | tr -d '=\n\r' | tr '+/' '-_')" \
+        && [[ ${#priv} -eq 43 && ${#pub} -eq 43 ]]; then
         X25519_PRIV="$priv"; X25519_PUB="$pub"
         rm -rf "$tmp"
         return 0
@@ -419,10 +462,14 @@ port_in_use() {
 }
 
 # next_free_port [proto] [min] [max] — печатает первый свободный порт.
+# Учитывает и занятость в БД панели (другой inbound на том же порту).
 next_free_port() {
     local proto="${1:-tcp}" min="${2:-10000}" max="${3:-59999}" p
     for p in $(seq "$min" "$max"); do
-        port_in_use "$p" "$proto" || { printf '%s' "$p"; return 0; }
+        if ! port_in_use "$p" "$proto" && ! db_port_in_use "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
     done
     return 1
 }
@@ -452,7 +499,46 @@ pick_port() {
         fi
         return $?
     fi
+    if db_port_in_use "$answer"; then
+        warn "Порт $answer уже используется другим каналом в панели."
+        if confirm "Продолжить с занятым портом?"; then
+            printf -v "$var" '%s' "$answer"
+        else
+            pick_port "$var" "$proto"
+        fi
+        return $?
+    fi
     printf -v "$var" '%s' "$answer"
+}
+
+# db_port_in_use <порт> — занят ли порт другим inbound в БД панели.
+db_port_in_use() {
+    local port="$1"
+    sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE port = $port LIMIT 1;" 2>/dev/null | grep -q .
+}
+
+# db_remark_in_use <remark> — есть ли канал с таким наименованием (remark).
+db_remark_in_use() {
+    local remark="$1"
+    sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE remark = '$(sql_escape "$remark")' LIMIT 1;" 2>/dev/null | grep -q .
+}
+
+# db_path_in_use <path> — используется ли путь другим каналом за прокси.
+db_path_in_use() {
+    local path="$1"
+    [[ -z "$path" || "$path" == "/" ]] && return 1
+    sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE stream_settings LIKE '%\"path\": \"$(sql_escape "$path")\"%' LIMIT 1;" 2>/dev/null | grep -q .
+}
+
+# db_sni_in_use <sni> <tls|reality> — занят ли SNI другим каналом.
+# Для tls ищем "serverName", для reality — "serverNames" (массив).
+db_sni_in_use() {
+    local sni="$1" kind="${2:-tls}"
+    if [[ "$kind" == "reality" ]]; then
+        sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE stream_settings LIKE '%\"serverNames\": [\"$(sql_escape "$sni")\"]%' LIMIT 1;" 2>/dev/null | grep -q .
+    else
+        sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE stream_settings LIKE '%\"serverName\": \"$(sql_escape "$sni")\"%' LIMIT 1;" 2>/dev/null | grep -q .
+    fi
 }
 
 # --- Работа с firewall ------------------------------------------------------------
@@ -479,6 +565,30 @@ firewall_port_open() {
         ok "firewalld: открыт порт ${port}/${proto}."
     else
         warn "Активный firewall (ufw/firewalld) не обнаружен — порт ${port}/${proto} наружу не открыт."
+    fi
+}
+
+# firewall_port_close <порт> <tcp|udp|both> — закрывает порт в активном firewall.
+firewall_port_close() {
+    local port="$1" proto="${2:-tcp}"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        case "$proto" in
+            tcp)  ufw deny "${port}"/tcp >/dev/null ;;
+            udp)  ufw deny "${port}"/udp >/dev/null ;;
+            both) ufw deny "${port}"/tcp >/dev/null; ufw deny "${port}"/udp >/dev/null ;;
+        esac
+        ok "ufw: закрыт порт ${port}/${proto}."
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        case "$proto" in
+            tcp)  firewall-cmd --permanent --remove-port="${port}"/tcp >/dev/null ;;
+            udp)  firewall-cmd --permanent --remove-port="${port}"/udp >/dev/null ;;
+            both) firewall-cmd --permanent --remove-port="${port}"/tcp >/dev/null
+                  firewall-cmd --permanent --remove-port="${port}"/udp >/dev/null ;;
+        esac
+        firewall-cmd --reload >/dev/null
+        ok "firewalld: закрыт порт ${port}/${proto}."
+    else
+        warn "Активный firewall (ufw/firewalld) не обнаружен — порт ${port}/${proto} не закрыт."
     fi
 }
 
@@ -616,13 +726,20 @@ build_settings() {
 
 # --- Сборка stream_settings ---------------------------------------------------------
 
-# tls_settings <serverName> — JSON tlsSettings с сертификатом панели.
+# tls_settings <serverName> — JSON tlsSettings. Для канала с уникальным SNI
+# (TCP+TLS) используется его собственный сертификат из CHANNEL_CERT_DIR,
+# иначе — сертификат панели; при отсутствии — self-signed.
 tls_settings() {
     local sni="${1:-}"
-    if [[ -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
-        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$PANEL_CERT" "$PANEL_CERT_KEY"
+    local cert="$PANEL_CERT" key="$PANEL_CERT_KEY"
+    if [[ -n "${CHANNEL_CERT_DIR:-}" ]]; then
+        cert="$CHANNEL_CERT_DIR/fullchain.pem"
+        key="$CHANNEL_CERT_DIR/privkey.pem"
+    fi
+    if [[ -n "$cert" && -n "$key" ]]; then
+        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$cert" "$key"
     else
-        printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "Сертификат панели не найден — будет выпущен self-signed для канала." >&2
+        printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "Сертификат не найден — будет выпущен self-signed для канала." >&2
         gen_selfsigned_inbound_cert
         printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$PANEL_CERT" "$PANEL_CERT_KEY"
     fi
@@ -648,6 +765,114 @@ gen_selfsigned_inbound_cert() {
     fi
     PANEL_CERT="$dir/fullchain.pem"
     PANEL_CERT_KEY="$dir/privkey.pem"
+}
+
+# cert_covers <cert> <домен> — покрывает ли сертификат домен в SAN.
+cert_covers() {
+    [[ -f "$1" ]] || return 1
+    openssl x509 -in "$1" -noout -text 2>/dev/null | grep -Eq "DNS:${2}(,|$| )"
+}
+
+# issue_selfsigned_channel_cert <домен> — self-signed сертификат для канала
+# в /root/cert/inbounds/<домен>/ (запасной вариант, когда acme недоступен).
+issue_selfsigned_channel_cert() {
+    local domain="$1" dir
+    dir="/root/cert/inbounds/${domain}"
+    mkdir -p "$dir"
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$dir/privkey.pem" -out "$dir/fullchain.pem" -days 3650 \
+        -subj "/CN=${domain}" \
+        -addext "subjectAltName=DNS:${domain}" >/dev/null 2>&1 \
+        || openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$dir/privkey.pem" -out "$dir/fullchain.pem" -days 3650 \
+        -subj "/CN=${domain}" \
+        -addext "subjectAltName=DNS:${domain}" >/dev/null 2>&1 \
+        || die "Не удалось выпустить self-signed сертификат для $domain."
+    chmod 600 "$dir/privkey.pem"
+    chmod 644 "$dir/fullchain.pem"
+    ok "Self-signed сертификат канала: $dir"
+}
+
+# issue_domain_cert <домен> — сертификат канала через acme.sh (ZeroSSL, HTTP-01).
+# Перед выпуском проверяет, что DNS уже резолвится на IP сервера.
+issue_domain_cert() {
+    local domain="$1"
+    local ACME_SH="${HOME}/.acme.sh/acme.sh"
+    local CERT_DIR="/root/cert/inbounds/${domain}"
+
+    if port_in_use 80 tcp; then
+        warn "Порт 80 занят — HTTP-01 acme может не пройти."
+        confirm "Продолжить всё равно?" || return 1
+    fi
+
+    # Проверка DNS: запись A должна указывать на этот сервер
+    local resolved=""
+    resolved="$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u | head -1 || true)"
+    if [[ -n "$resolved" && "$resolved" != "$SERVER_IP" ]]; then
+        warn "DNS: $domain → $resolved (ожидался $SERVER_IP)."
+        confirm "Продолжить выпуск всё равно?" || return 1
+    elif [[ -z "$resolved" ]]; then
+        warn "DNS-запись для $domain не найдена — HTTP-01 не пройдёт."
+        confirm "Продолжить всё равно?" || return 1
+    fi
+
+    if [[ ! -x "$ACME_SH" ]]; then
+        info "Устанавливаем acme.sh..."
+        curl -s https://get.acme.sh | sh >/dev/null 2>&1 || true
+        [[ -x "$ACME_SH" ]] || { warn "acme.sh не установился."; return 1; }
+    fi
+
+    local email=""
+    ask "E-mail для ZeroSSL (регистрация в CA)" "" email
+    [[ -n "$email" ]] || { warn "E-mail не указан — ZeroSSL недоступен."; return 1; }
+
+    firewall_port_open 80 tcp 2>/dev/null || true
+    mkdir -p "$CERT_DIR"
+    "$ACME_SH" --set-default-ca --server zerossl >/dev/null 2>&1
+    "$ACME_SH" --register-account -m "$email" >/dev/null 2>&1 || true
+    if "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 --server zerossl --force; then
+        "$ACME_SH" --installcert --force -d "$domain" \
+            --key-file "$CERT_DIR/privkey.pem" \
+            --fullchain-file "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 || true
+        # При продлении acme.sh будет обновлять копии в каталоге канала
+        "$ACME_SH" --installcert --force -d "$domain" \
+            --reloadcmd "mkdir -p '$CERT_DIR' && cp -f '$HOME/.acme.sh/${domain}/${domain}.key' '$CERT_DIR/privkey.pem' && cp -f '$HOME/.acme.sh/${domain}/fullchain.cer' '$CERT_DIR/fullchain.pem'" >/dev/null 2>&1 || true
+        if [[ -f "$CERT_DIR/fullchain.pem" && -f "$CERT_DIR/privkey.pem" ]]; then
+            chmod 600 "$CERT_DIR/privkey.pem"
+            chmod 644 "$CERT_DIR/fullchain.pem"
+            ok "Выпущен сертификат канала для $domain."
+            return 0
+        fi
+    fi
+    warn "Не удалось выпустить сертификат для $domain."
+    return 1
+}
+
+# ensure_channel_cert <домен> — гарантирует наличие сертификата для канала.
+# Приоритет: сертификат панели (если покрывает домен) → существующий сертификат
+# канала → выпуск acme.sh (ZeroSSL) → self-signed.
+ensure_channel_cert() {
+    local domain="$1" dir
+    dir="/root/cert/inbounds/${domain}"
+    if cert_covers "$PANEL_CERT" "$domain"; then
+        info "Сертификат панели уже покрывает $domain — используем его."
+        CHANNEL_CERT_DIR=""
+        return 0
+    fi
+    if [[ -f "$dir/fullchain.pem" && -f "$dir/privkey.pem" ]]; then
+        ok "Сертификат канала уже есть: $dir"
+        CHANNEL_CERT_DIR="$dir"
+        return 0
+    fi
+    CHANNEL_CERT_DIR="$dir"
+    if confirm "Выпустить сертификат для $domain (acme.sh/ZeroSSL, нужна DNS-запись)?" "y"; then
+        issue_domain_cert "$domain" \
+            && { ok "Сертификат канала готов: $dir"; return 0; }
+        warn "Выпуск не удался — используем self-signed (не рекомендуется для клиентов)."
+    else
+        warn "Сертификат канала будет self-signed."
+    fi
+    issue_selfsigned_channel_cert "$domain"
 }
 
 # gen_reality_keys — генерирует ключи REALITY ОДИН раз в текущем шелле
@@ -742,6 +967,40 @@ db_has_column() {
     sqlite3 "$XUI_DB" "PRAGMA table_info($1);" 2>/dev/null | awk -F'|' -v c="$2" '$2 == c { found=1 } END { exit !found }'
 }
 
+# db_has_table <таблица> — существует ли таблица.
+db_has_table() {
+    sqlite3 "$XUI_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='$1';" 2>/dev/null | grep -q "$1"
+}
+
+# db_delete_inbound <id> — удаляет канал: inbound, hosts, привязки клиентов;
+# клиенты, оставшиеся без каналов, удаляются вместе со своей статистикой.
+db_delete_inbound() {
+    local id="$1"
+    local orphans=""
+    orphans="$(sqlite3 "$XUI_DB" "
+SELECT ci.client_id FROM client_inbounds ci
+WHERE ci.inbound_id = $id
+  AND ci.client_id NOT IN (SELECT client_id FROM client_inbounds WHERE inbound_id != $id);" 2>/dev/null || true)"
+    if sqlite3 "$XUI_DB" "BEGIN;
+DELETE FROM client_inbounds WHERE inbound_id = $id;
+$(db_has_table hosts && echo "DELETE FROM hosts WHERE inbound_id = $id;")
+DELETE FROM inbounds WHERE id = $id;
+COMMIT;" 2>/dev/null; then
+        :
+    else
+        sqlite3 "$XUI_DB" "ROLLBACK;" 2>/dev/null || true
+        die "Ошибка удаления канала (id=$id)."
+    fi
+    local cid=""
+    for cid in $orphans; do
+        if db_has_table client_traffics; then
+            sqlite3 "$XUI_DB" "DELETE FROM client_traffics WHERE client_id = $cid;" 2>/dev/null || true
+        fi
+        sqlite3 "$XUI_DB" "DELETE FROM clients WHERE id = $cid;" 2>/dev/null || true
+    done
+    ok "Канал (id=$id) удалён из базы панели."
+}
+
 # db_insert_inbound <settings_json> <stream_json> <sniffing_json> — вставка inbound.
 # Возвращает (через переменную INBOUND_ID) новый id.
 db_insert_inbound() {
@@ -772,6 +1031,72 @@ SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в б
 
 # db_add_client_records <inbound_id> — таблицы clients/client_inbounds/client_traffics.
 # Работает только для протоколов с клиентами (не http/mixed).
+# load_existing_client <client_id> — заполняет CLIENT_* данными существующего
+# клиента. Источник: settings первого канала клиента с подходящим протоколом
+# (истинные данные, которые видит xray); если каналов нет (сирота) — таблица
+# clients. Сохраняет существующий subId клиента (иначе сломается подписка).
+load_existing_client() {
+    local cid="$1" settings="" block="" inbound_id="" esc=""
+    esc="$(printf '%s' "$CLIENT_EMAIL" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+    inbound_id="$(sqlite3 "$XUI_DB" "SELECT ci.inbound_id FROM client_inbounds ci JOIN inbounds i ON i.id = ci.inbound_id WHERE ci.client_id = $cid AND i.protocol = '$(sql_escape "$PROTOCOL")' ORDER BY ci.inbound_id LIMIT 1;" 2>/dev/null || true)"
+    if [[ -n "$inbound_id" ]]; then
+        settings="$(sqlite3 "$XUI_DB" "SELECT settings FROM inbounds WHERE id = $inbound_id;" 2>/dev/null || true)"
+        settings="$(printf '%s' "$settings" | tr -d '\n')"
+        block="$(printf '%s' "$settings" | grep -oE '\{"email"[[:space:]]*:[[:space:]]*"'"$esc"'"[^}]*\}' | head -1 || true)"
+    fi
+    if [[ -n "$block" ]]; then
+        case "$PROTOCOL" in
+            vless)
+                CLIENT_ID="$(json_extract "$block" id)"
+                CLIENT_FLOW="$(json_extract "$block" flow)"
+                ;;
+            vmess)
+                CLIENT_ID="$(json_extract "$block" id)"
+                ;;
+            trojan)
+                CLIENT_PW="$(json_extract "$block" password)"
+                ;;
+            shadowsocks)
+                CLIENT_PSK="$(json_extract "$block" password)"
+                local m=""
+                m="$(json_extract "$settings" method)"
+                [[ -n "$m" ]] && SS_METHOD="$m"
+                ;;
+            hysteria)
+                CLIENT_AUTH="$(json_extract "$block" auth)"
+                ;;
+            wireguard)
+                CLIENT_PRIV="$(json_extract "$block" privateKey)"
+                CLIENT_PUB="$(json_extract "$block" publicKey)"
+                ;;
+            mtproto)
+                CLIENT_SECRET="$(json_extract "$block" secret)"
+                ;;
+        esac
+    else
+        # Сирота — каналов нет, берём поля из clients
+        local row=""
+        row="$(sqlite3 "$XUI_DB" "SELECT uuid, password, auth, flow, sub_id, secret, wg_private_key, wg_public_key FROM clients WHERE id = $cid;" 2>/dev/null || true)"
+        local uu="" pw="" au="" fl="" se="" wgpk="" wgpub=""
+        IFS='|' read -r uu pw au fl _ se wgpk wgpub <<< "$row" || true
+        case "$PROTOCOL" in
+            vless)      CLIENT_ID="$uu"; CLIENT_FLOW="$fl" ;;
+            vmess)      CLIENT_ID="$uu" ;;
+            trojan)     CLIENT_PW="$pw" ;;
+            shadowsocks) CLIENT_PSK="$pw" ;;
+            hysteria)   CLIENT_AUTH="$au" ;;
+            wireguard)  CLIENT_PRIV="$wgpk"; CLIENT_PUB="$wgpub" ;;
+            mtproto)    CLIENT_SECRET="$se" ;;
+        esac
+    fi
+    local subid=""
+    subid="$(sqlite3 "$XUI_DB" "SELECT sub_id FROM clients WHERE id = $cid;" 2>/dev/null || true)"
+    if [[ -n "$subid" && "$subid" != "$CLIENT_SUBID" ]]; then
+        warn "Клиент уже имеет subId=$subid — используем его (введённый $CLIENT_SUBID игнорируется)."
+        CLIENT_SUBID="$subid"
+    fi
+}
+
 db_add_client_records() {
     local inbound_id="$1" now cid
     [[ "$PROTOCOL" == "http" || "$PROTOCOL" == "mixed" ]] && return 0
@@ -785,29 +1110,36 @@ db_add_client_records() {
     existing="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
         cid="$existing"
-        local upd
-        upd="sub_id = '$(sql_escape "$CLIENT_SUBID")',
-            uuid = '$(sql_escape "$CLIENT_ID")',
-            password = '$(sql_escape "$CLIENT_PW")',
-            auth = '$(sql_escape "$CLIENT_AUTH")',
-            flow = '$(sql_escape "$CLIENT_FLOW")',
-            security = 'auto',
-            limit_ip = 0, total_gb = 0, expiry_time = 0, enable = 1, tg_id = 0,
-            comment = '', reset = 0"
-        if db_has_column clients updated_at; then
-            upd="$upd, updated_at = $now"
+        if [[ "$REUSE_CLIENT" == "1" ]]; then
+            # Переиспользуемый клиент: протокол-поля (uuid/password/auth/flow/
+            # secret/wg_*) НЕ перезаписываем — иначе сломаются старые каналы,
+            # где в settings сохранены прежние значения.
+            :
+        else
+            local upd
+            upd="sub_id = '$(sql_escape "$CLIENT_SUBID")',
+                uuid = '$(sql_escape "$CLIENT_ID")',
+                password = '$(sql_escape "$CLIENT_PW")',
+                auth = '$(sql_escape "$CLIENT_AUTH")',
+                flow = '$(sql_escape "$CLIENT_FLOW")',
+                security = 'auto',
+                limit_ip = 0, total_gb = 0, expiry_time = 0, enable = 1, tg_id = 0,
+                comment = '', reset = 0"
+            if db_has_column clients updated_at; then
+                upd="$upd, updated_at = $now"
+            fi
+            if db_has_column clients wg_private_key; then
+                upd="$upd,
+                wg_private_key = '$(sql_escape "$wg_pk")',
+                wg_public_key = '$(sql_escape "$wg_pub")',
+                wg_allowed_ips = '$(sql_escape "$wg_ips")',
+                wg_pre_shared_key = '', wg_keep_alive = $wg_ka"
+            fi
+            if db_has_column clients secret; then
+                upd="$upd, secret = '$(sql_escape "$CLIENT_SECRET")'"
+            fi
+            sqlite3 "$XUI_DB" "UPDATE clients SET $upd WHERE id = $cid;" || die "Ошибка обновления клиента."
         fi
-        if db_has_column clients wg_private_key; then
-            upd="$upd,
-            wg_private_key = '$(sql_escape "$wg_pk")',
-            wg_public_key = '$(sql_escape "$wg_pub")',
-            wg_allowed_ips = '$(sql_escape "$wg_ips")',
-            wg_pre_shared_key = '', wg_keep_alive = $wg_ka"
-        fi
-        if db_has_column clients secret; then
-            upd="$upd, secret = '$(sql_escape "$CLIENT_SECRET")'"
-        fi
-        sqlite3 "$XUI_DB" "UPDATE clients SET $upd WHERE id = $cid;" || die "Ошибка обновления клиента."
     else
         local cols vals
         cols="email, sub_id, uuid, password, auth, flow, security, reverse,
@@ -896,16 +1228,54 @@ urlencode() {
 # b64url — base64 url-safe без padding.
 b64url() { printf '%s' "$1" | base64 | tr -d '=\n' | tr '+/' '-_'; }
 
+# json_extract <json> <ключ> [num|list] — значение поля из однострочного JSON.
+json_extract() {
+    local json="$1" key="$2" mode="${3:-}"
+    case "$mode" in
+        num)  printf '%s' "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1 ;;
+        list) printf '%s' "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | head -1 ;;
+        *)    printf '%s' "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 ;;
+    esac
+}
+
 # sha256_first <строка> <n> — первые n hex-символов sha256.
 sha256_first() {
     printf '%s' "$1" | openssl dgst -sha256 -hex 2>/dev/null | sed -n 's/^.*= //p' | cut -c1-"$2"
 }
 
 # gen_link_vless — vless:// ссылка.
+# link_external — адрес:порт для share-ссылки с учётом прокси.
+# WS/gRPC/xHTTP/httpupgrade за nginx: внешний домен панели на 443.
+# REALITY/TLS+TCP: после перехода на stream-мастер (STREAM_443_MASTER=1) —
+# домен панели на 443, иначе собственный внешний порт канала.
+link_external() {
+    case "$TRANSPORT" in
+        ws|grpc|xhttp|httpupgrade)
+            if [[ "$USE_NGINX" == "1" ]]; then
+                printf '%s:443' "${PANEL_HOST:-$(external_addr)}"
+            else
+                printf '%s:%s' "$(external_addr)" "$PORT"
+            fi
+            ;;
+        tcp)
+            if [[ "$STREAM_443_MASTER" == "1" ]]; then
+                printf '%s:443' "${PANEL_HOST:-$(external_addr)}"
+            else
+                printf '%s:%s' "$(external_addr)" "$PORT"
+            fi
+            ;;
+        *)
+            printf '%s:%s' "$(external_addr)" "$PORT"
+            ;;
+    esac
+}
+
 gen_link_vless() {
-    local addr
-    addr="$(external_addr)"
-    local link="vless://${CLIENT_ID}@${addr}:${PORT}"
+    local ln ln_addr ln_port
+    ln="$(link_external)"
+    ln_addr="${ln%:*}"
+    ln_port="${ln##*:}"
+    local link="vless://${CLIENT_ID}@${ln_addr}:${ln_port}"
     local q=("type=${TRANSPORT}")
     if [[ "$SECURITY" == "reality" ]]; then
         q+=("security=reality" "pbk=${REALITY_PUBLIC_KEY}" "fp=chrome" "sni=${REALITY_SNI}" "sid=${REALITY_SHORT_ID}")
@@ -930,9 +1300,11 @@ gen_link_vless() {
 
 # gen_link_vmess — vmess://base64(JSON).
 gen_link_vmess() {
-    local addr tls_sni="" fp="" alpn=""
-    addr="$(external_addr)"
-    local v="2" ps="$REMARK" add="$addr" port="$PORT" id="$CLIENT_ID" scy="auto"
+    local ln ln_addr ln_port tls_sni="" fp="" alpn=""
+    ln="$(link_external)"
+    ln_addr="${ln%:*}"
+    ln_port="${ln##*:}"
+    local v="2" ps="$REMARK" add="$ln_addr" port="$ln_port" id="$CLIENT_ID" scy="auto"
     local net="$TRANSPORT" type="none" path="" host="" tls=""
     case "$TRANSPORT" in
         ws)          net="ws"; path="${WS_PATH}"; host="${WS_HOST:-}" ;;
@@ -954,9 +1326,11 @@ gen_link_vmess() {
 
 # gen_link_trojan — trojan:// ссылка.
 gen_link_trojan() {
-    local addr link
-    addr="$(external_addr)"
-    link="trojan://$(urlencode "$CLIENT_PW")@${addr}:${PORT}"
+    local ln ln_addr ln_port link
+    ln="$(link_external)"
+    ln_addr="${ln%:*}"
+    ln_port="${ln##*:}"
+    link="trojan://$(urlencode "$CLIENT_PW")@${ln_addr}:${ln_port}"
     local q=("type=${TRANSPORT}")
     if [[ "$SECURITY" == "reality" ]]; then
         q+=("security=reality" "pbk=${REALITY_PUBLIC_KEY}" "fp=chrome" "sni=${REALITY_SNI}" "sid=${REALITY_SHORT_ID}")
@@ -978,8 +1352,10 @@ gen_link_trojan() {
 
 # gen_link_ss — ss:// ссылка (SIP002).
 gen_link_ss() {
-    local addr method="$SS_METHOD" server_psk="" userinfo=""
-    addr="$(external_addr)"
+    local ln ln_addr ln_port method="$SS_METHOD" server_psk="" userinfo=""
+    ln="$(link_external)"
+    ln_addr="${ln%:*}"
+    ln_port="${ln##*:}"
     if [[ "$method" == 2022-* ]]; then
         # SIP022: метод и пароли percent-encoded, без base64
         server_psk="$(db_get_inbound_server_psk "$INBOUND_ID")"
@@ -991,7 +1367,7 @@ gen_link_ss() {
     case "$TRANSPORT" in
         ws) q+=("type=ws" "path=${WS_PATH}" "host=${WS_HOST:-}") ;;
     esac
-    local link="ss://${userinfo}@${addr}:${PORT}"
+    local link="ss://${userinfo}@${ln_addr}:${ln_port}"
     if ((${#q[@]} > 0)); then
         printf '%s?%s#%s\n' "$link" "$(join_q "${q[@]}")" "$(urlencode "$REMARK")"
     else
@@ -1185,6 +1561,11 @@ BLOCK
 # nginx_add_stream_sni — stream-SNI правило для REALITY/TCP-passthrough.
 nginx_add_stream_sni() {
     [[ -f "$NGINX_STREAM" ]] || return 0
+    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+        info "Режим stream-мастера — обновляем map из БД."
+        nginx_stream_master_rebuild
+        return 0
+    fi
     local sni_block
     sni_block=$(cat <<BLOCK
 
@@ -1221,6 +1602,11 @@ BLOCK
 # nginx_add_stream_tcp — TCP-passthrough для TLS-канала (VMess/VLESS/Trojan+TCP+TLS).
 nginx_add_stream_tcp() {
     [[ -f "$NGINX_STREAM" ]] || return 0
+    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+        info "Режим stream-мастера — обновляем map из БД."
+        nginx_stream_master_rebuild
+        return 0
+    fi
     if grep -Eqs "listen[[:space:]]+${PORT}[[:space:]]*(;|udp|$)" "$NGINX_STREAM" \
         && grep -Eqs "proxy_pass[[:space:]]+127\.0\.0\.1:${PORT}" "$NGINX_STREAM"; then
         info "stream-passthrough для порта ${PORT} уже настроен."
@@ -1250,6 +1636,233 @@ BLOCK
         systemctl reload nginx >/dev/null 2>&1 && ok "nginx (stream) перезагружен."
     fi
     ok "Добавлено stream (TCP-passthrough) правило в $NGINX_STREAM"
+}
+
+# stream_ssl_preread_ok — есть ли модуль stream_ssl_preread в nginx.
+stream_ssl_preread_ok() {
+    nginx -V 2>&1 | grep -q "stream_ssl_preread"
+}
+
+# is_stream_443_master — включён ли режим stream-мастера (по маркеру в файле).
+is_stream_443_master() {
+    [[ -f "$NGINX_STREAM" ]] && grep -Eqs 'stream-443 master' "$NGINX_STREAM"
+}
+
+# nginx_stream_master_rebuild — пересобирает NGINX_STREAM в режиме мастера:
+# один server listen 443 с ssl_preread и map SNI → 127.0.0.1:<порт>.
+# default → внутренний http-модуль nginx (панель + WS/gRPC).
+# Каналы TLS/REALITY за nginx без SNI — отдельные passthrough-блоки.
+nginx_stream_master_rebuild() {
+    [[ -f "$NGINX_STREAM" ]] || return 0
+    local map_lines="" pass_lines="" row="" id="" port="" listen="" ss="" sni=""
+    local rows="" sni_esc=""
+    rows="$(sqlite3 "$XUI_DB" "SELECT id, port, listen, stream_settings FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
+    while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        id="${row%%|*}"; row="${row#*|}"
+        port="${row%%|*}"; row="${row#*|}"
+        listen="${row%%|*}"; ss="${row#*|}"
+        [[ "$listen" != "127.0.0.1" ]] && continue
+        # Только TCP (REALITY/TLS+TCP); WS/gRPC идут через http-модуль
+        printf '%s' "$ss" | grep -q '"network"[[:space:]]*:[[:space:]]*"tcp"' || continue
+        sni=""
+        if printf '%s' "$ss" | grep -q '"realitySettings"'; then
+            sni="$(printf '%s' "$ss" | sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+        elif printf '%s' "$ss" | grep -q '"tlsSettings"'; then
+            sni="$(printf '%s' "$ss" | sed -n 's/.*"serverName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+        fi
+        if [[ -n "$sni" ]]; then
+            sni_esc="$(printf '%s' "$sni" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+            if ! printf '%s' "$map_lines" | grep -Eq "^    ${sni_esc}[[:space:]]+127\.0\.0\.1:${port};$"; then
+                map_lines="${map_lines}    ${sni}  127.0.0.1:${port};
+"
+            else
+                warn "Дубль SNI $sni в БД — в map учтён только один канал (id=$id)."
+            fi
+        else
+            pass_lines="${pass_lines}
+# inbound-xray.sh: passthrough без SNI (id=$id, порт ${port})
+server {
+    listen ${port};
+    proxy_pass 127.0.0.1:${port};
+}
+"
+        fi
+    done <<< "$rows"
+
+    local tmp bak
+    tmp="$(mktemp)"
+    bak="$(mktemp)"
+    cp -a "$NGINX_STREAM" "$bak" || return 1
+    cat > "$tmp" <<EOF
+# inbound-xray.sh: stream-443 master (все внешние TLS-потоки идут на ${STREAM_MASTER_PORT:-443})
+map \$ssl_preread_server_name \$xui_backend {
+${map_lines}    default  127.0.0.1:${PANEL_SSL_PORT};
+}
+
+server {
+    listen ${STREAM_MASTER_PORT:-443};
+    proxy_pass \$xui_backend;
+    ssl_preread on;
+}
+${pass_lines}
+EOF
+    if ! cp -a "$tmp" "$NGINX_STREAM"; then
+        cp -a "$bak" "$NGINX_STREAM"
+        rm -f "$tmp" "$bak"
+        return 1
+    fi
+    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+        warn "nginx -t не прошёл — откат stream-конфигурации."
+        cp -a "$bak" "$NGINX_STREAM"
+        rm -f "$tmp" "$bak"
+        return 1
+    fi
+    rm -f "$tmp" "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 && ok "nginx (stream-мастер) перезагружен."
+    fi
+}
+
+# nginx_stream_master_setup — включает режим stream-мастера на 443.
+nginx_stream_master_setup() {
+    command -v nginx >/dev/null 2>&1 || die "nginx не установлен — stream-мастер невозможен."
+    stream_ssl_preread_ok || die "В nginx нет модуля stream_ssl_preread (нужен nginx-full/extra)."
+    if port_in_use "${STREAM_MASTER_PORT:-443}" tcp && ! is_stream_443_master; then
+        warn "Порт ${STREAM_MASTER_PORT:-443} занят другим процессом."
+        confirm "Продолжить (порт будет перехвачен nginx)?" || return 1
+    fi
+    if [[ "$PANEL_PORT" == "${STREAM_MASTER_PORT:-443}" ]]; then
+        warn "Панель слушает на 443. Перенеси её на внутренний порт:"
+        warn "  x-ui setting -port 2053 && systemctl restart x-ui"
+        die "Невозможно занять 443 для stream-мастера."
+    fi
+    if [[ -z "$PANEL_SSL_PORT" ]]; then
+        PANEL_SSL_PORT="8443"
+    fi
+    if port_in_use "$PANEL_SSL_PORT" tcp; then
+        local alt=""
+        next_free_port alt tcp 8500 8999 || die "Нет свободного внутреннего порта."
+        PANEL_SSL_PORT="$alt"
+    fi
+    info "Внутренний https-порт nginx (панель + WS/gRPC): 127.0.0.1:${PANEL_SSL_PORT}"
+    if [[ "$PROXY_SCHEME" == "https" && -n "$PANEL_CERT" ]]; then
+        info "Используется сертификат панели: $PANEL_CERT"
+    else
+        warn "Сертификат панели не найден — внешние клиенты не смогут проверить цепочку."
+    fi
+
+    STREAM_443_MASTER=1
+    nginx_stream_master_rebuild || { STREAM_443_MASTER=""; return 1; }
+
+    local conf="$NGINX_CONF"
+    if [[ -z "$conf" || ! -f "$conf" ]]; then
+        detect_nginx_conf
+        conf="$NGINX_CONF"
+    fi
+    [[ -z "$conf" || ! -f "$conf" ]] && conf="/etc/nginx/conf.d/x-ui.conf"
+    local mode="panel"
+    [[ -n "$ENABLE_LANDING" ]] && mode="landing"
+    write_panel_conf "$conf" "$mode" || { STREAM_443_MASTER=""; return 1; }
+
+    # Порт в hosts-записях TLS/REALITY за прокси → 443
+    if db_has_column hosts port; then
+        sqlite3 "$XUI_DB" "UPDATE hosts SET port = ${STREAM_MASTER_PORT:-443} WHERE inbound_id IN (SELECT id FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1');" 2>/dev/null || true
+    fi
+
+    PROXY_PORT="${STREAM_MASTER_PORT:-443}"
+    PROXY_SCHEME="https"
+    firewall_port_open "${STREAM_MASTER_PORT:-443}" tcp
+    ok "Всё внешнее трафик теперь через ${STREAM_MASTER_PORT:-443} (stream-мастер)."
+    ok "Панель доступна: https://${PANEL_HOST:-$(external_addr)}${PANEL_PATH:-/}"
+}
+
+# nginx_stream_rebuild_legacy — пересобирает NGINX_STREAM в классическом режиме
+# (без мастера): отдельный server listen <порт> на каждый TLS/REALITY канал
+# за nginx. Используется при удалении каналов, чтобы не оставлять «хвосты».
+nginx_stream_rebuild_legacy() {
+    [[ -f "$NGINX_STREAM" ]] || return 0
+    local blocks="" row="" port="" listen="" ss="" tmp bak
+    local rows=""
+    rows="$(sqlite3 "$XUI_DB" "SELECT port, listen, stream_settings FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1' AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
+    while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        port="${row%%|*}"; row="${row#*|}"
+        listen="${row%%|*}"; ss="${row#*|}"
+        if ! printf '%s' "$ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"tcp"'; then
+            continue
+        fi
+        if ! printf '%s' "$ss" | grep -Eq '"tlsSettings"|"realitySettings"'; then
+            continue
+        fi
+        blocks="${blocks}
+
+# inbound-xray.sh: stream-passthrough порт ${port}
+server {
+    listen ${port};
+    proxy_pass 127.0.0.1:${port};
+}
+"
+    done <<< "$rows"
+    tmp="$(mktemp)"; bak="$(mktemp)"
+    cp -a "$NGINX_STREAM" "$bak" || return 1
+    cat > "$tmp" <<EOF
+# inbound-xray.sh: stream-passthrough правила (собрано из БД панели)
+${blocks}
+EOF
+    if ! cp -a "$tmp" "$NGINX_STREAM"; then
+        cp -a "$bak" "$NGINX_STREAM"
+        rm -f "$tmp" "$bak"
+        return 1
+    fi
+    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+        warn "nginx -t не прошёл — откат stream-конфигурации."
+        cp -a "$bak" "$NGINX_STREAM"
+        rm -f "$tmp" "$bak"
+        return 1
+    fi
+    rm -f "$tmp" "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 && ok "nginx (stream) перезагружен."
+    fi
+}
+
+# delete_channel — меню удаления канала из панели (БД + nginx + firewall).
+delete_channel() {
+    local rows=""
+    rows="$(sqlite3 "$XUI_DB" "SELECT id, remark, port, protocol FROM inbounds ORDER BY id;" 2>/dev/null || true)"
+    if [[ -z "$rows" ]]; then
+        info "Каналов в панели нет."
+        return 0
+    fi
+    banner "  ========== Каналы панели =========="
+    local list=() i=1 id="" remark="" port="" proto="" rest="" sel="" del_id="" del_remark="" del_port="" del_proto=""
+    while IFS= read -r line; do
+        id="${line%%|*}"; rest="${line#*|}"
+        remark="${rest%%|*}"; rest="${rest#*|}"
+        port="${rest%%|*}"; proto="${rest#*|}"
+        list+=("$id|$remark|$port|$proto")
+        echo "  $i) id=$id  ${proto}:${port}  $remark"
+        i=$((i + 1))
+    done <<< "$rows"
+    read -r -p "Номер канала для удаления (0 — отмена): " sel || return 0
+    [[ "$sel" =~ ^[0-9]+$ ]] || return 0
+    (( sel >= 1 && sel <= ${#list[@]} )) || { warn "Неверный номер."; return 0; }
+    IFS='|' read -r del_id del_remark del_port del_proto <<< "${list[$((sel - 1))]}"
+    if ! confirm "Удалить канал #$del_id «$del_remark» (${del_proto}:${del_port})?"; then
+        info "Отменено."
+        return 0
+    fi
+    db_delete_inbound "$del_id"
+    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+        nginx_stream_master_rebuild
+    else
+        nginx_stream_rebuild_legacy
+    fi
+    firewall_port_close "$del_port" tcp 2>/dev/null || true
+    firewall_port_close "$del_port" udp 2>/dev/null || true
+    restart_xui
+    ok "Канал «$del_remark» удалён."
 }
 
 # =============================================================================
@@ -1384,7 +1997,13 @@ write_panel_conf() {
     local file="$1" mode="$2"
     local listen_dir="    listen ${PROXY_PORT};"
     local ssl_lines=""
-    if [[ "$PROXY_SCHEME" == "https" && -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
+    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+        listen_dir="    listen 127.0.0.1:${PANEL_SSL_PORT} ssl;"
+        if [[ -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
+            ssl_lines="    ssl_certificate     ${PANEL_CERT};
+    ssl_certificate_key ${PANEL_CERT_KEY};"
+        fi
+    elif [[ "$PROXY_SCHEME" == "https" && -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
         listen_dir="    listen ${PROXY_PORT} ssl;"
         ssl_lines="    ssl_certificate     ${PANEL_CERT};
     ssl_certificate_key ${PANEL_CERT_KEY};"
@@ -1457,11 +2076,17 @@ ${up_extra}
     local bak
     bak="$(mktemp)"
     [[ -f "$file" ]] && cp -a "$file" "$bak"
+    # WS/gRPC regex-location'ы живут в общем сниппете — подключаем его в server
+    local snippet_line=""
+    if [[ -f "$NGINX_SNIPPET" && "$NGINX_SNIPPET" != "$file" ]]; then
+        snippet_line="    include ${NGINX_SNIPPET};"
+    fi
     cat > "$file" <<EOF
 server {
 ${listen_dir}
 ${ssl_lines}
     server_name _;
+${snippet_line}
 
 ${panel_loc}${sub_loc}${root_loc}
 }
@@ -1504,7 +2129,10 @@ setup_landing() {
 
     # Внешний порт прокси
     if [[ -z "$PROXY_PORT" ]]; then
-        if [[ -n "$NGINX_CONF" && -f "$NGINX_CONF" ]]; then
+        if is_stream_443_master; then
+            PROXY_PORT="${STREAM_MASTER_PORT:-443}"
+            PROXY_SCHEME="https"
+        elif [[ -n "$NGINX_CONF" && -f "$NGINX_CONF" ]]; then
             PROXY_PORT="$(grep -Eo 'listen[[:space:]]+[0-9]+' "$NGINX_CONF" | awk '{print $2}' | head -1)"
             grep -Eqs 'listen[[:space:]]+[0-9]+[[:space:]]+[^;]*ssl' "$NGINX_CONF" && PROXY_SCHEME="https"
         else
@@ -1587,7 +2215,13 @@ db_add_host_record() {
         tcp)
             # Проксируются только TLS (passthrough) и REALITY (stream-SNI)
             case "$SECURITY" in
-                tls|reality) hport="$PORT" ;;
+                tls|reality)
+                    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+                        hport="${STREAM_MASTER_PORT:-443}"
+                    else
+                        hport="$PORT"
+                    fi
+                    ;;
                 *) return 0 ;;
             esac
             ;;
@@ -1667,6 +2301,7 @@ create_channel() {
     INBOUND_ID=""; WS_PATH=""; WS_HOST=""; SNI=""; LISTEN=""
     SS_METHOD=""
     REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""; REALITY_SNI=""
+    CHANNEL_SNI=""; CHANNEL_CERT_DIR=""; REUSE_CLIENT=""; EXISTING_CLIENT_ID=""
 
     menu_protocol
 
@@ -1691,15 +2326,46 @@ create_channel() {
     # Remark и клиент
     local def_remark def_email def_subid
     def_remark="${PROTOCOL^^}-${TRANSPORT^^}-${PORT}"
-    ask "Наименование канала (remark)" "$def_remark" REMARK
+    while true; do
+        ask "Наименование канала (remark)" "$def_remark" REMARK
+        if db_remark_in_use "$REMARK"; then
+            warn "Канал с наименованием «$REMARK» уже существует."
+            confirm "Продолжить с тем же именем?" || continue
+        fi
+        break
+    done
 
     def_email="user-$(gen_hex 3)"
     def_subid="$(gen_hex 8)"
-    ask "Email клиента" "$def_email" CLIENT_EMAIL
+    while true; do
+        ask "Email клиента" "$def_email" CLIENT_EMAIL
+        [[ -n "$CLIENT_EMAIL" ]] || die "Email клиента обязателен."
+        EXISTING_CLIENT_ID=""
+        if [[ "$PROTOCOL" != "http" && "$PROTOCOL" != "mixed" ]]; then
+            local cid="" plist=""
+            cid="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
+            if [[ -n "$cid" ]]; then
+                plist="$(sqlite3 "$XUI_DB" "SELECT DISTINCT i.protocol FROM client_inbounds ci JOIN inbounds i ON i.id = ci.inbound_id WHERE ci.client_id = $cid;" 2>/dev/null || true)"
+                if [[ -n "$plist" && "$plist" != "$PROTOCOL" ]]; then
+                    warn "Клиент «$CLIENT_EMAIL» уже есть, но его каналы — $plist (нужен $PROTOCOL)."
+                    warn "Переиспользование возможно только при совпадении протокола."
+                    continue
+                fi
+            fi
+            EXISTING_CLIENT_ID="$cid"
+        fi
+        break
+    done
     ask "Идентификатор подписки (subId)" "$def_subid" CLIENT_SUBID
 
-    # Запись данных клиента
-    make_client_data "$PROTOCOL" "$CLIENT_EMAIL" "$CLIENT_SUBID" "$CLIENT_FLOW"
+    # Данные клиента: при переиспользовании берём существующие (не генерируем)
+    if [[ -n "$EXISTING_CLIENT_ID" ]]; then
+        load_existing_client "$EXISTING_CLIENT_ID"
+        REUSE_CLIENT=1
+        info "Клиент «$CLIENT_EMAIL» уже существует — переиспользуем его данные."
+    else
+        make_client_data "$PROTOCOL" "$CLIENT_EMAIL" "$CLIENT_SUBID" "$CLIENT_FLOW"
+    fi
     if [[ "$PROTOCOL" == "http" || "$PROTOCOL" == "mixed" ]]; then
         CLIENT_JSON=""
     else
@@ -1709,15 +2375,63 @@ create_channel() {
     # Параметры пути и REALITY
     case "$TRANSPORT" in
         ws|grpc|xhttp|httpupgrade)
-            ask "Путь (для nginx удобен формат /<цифры>/<name>)" "/$(gen_hex 4)/$(gen_hex 5)" WS_PATH
+            while true; do
+                ask "Путь (для nginx удобен формат /<цифры>/<name>)" "/$(gen_hex 4)/$(gen_hex 5)" WS_PATH
+                if db_path_in_use "$WS_PATH"; then
+                    warn "Путь $WS_PATH уже используется другим каналом за прокси."
+                    confirm "Продолжить с тем же путём?" || continue
+                fi
+                break
+            done
             ;;
     esac
     if [[ "$SECURITY" == "tls" ]]; then
-        SNI="${PANEL_HOST:-$(external_addr)}"
-        info "SNI для TLS: $SNI"
+        if [[ "$TRANSPORT" == "tcp" ]]; then
+            # TCP+TLS: уникальный домен канала + собственный сертификат
+            local prefix="" def_sni=""
+            case "$PROTOCOL" in vless) prefix="v";; vmess) prefix="m";; trojan) prefix="t";; *) prefix="x";; esac
+            if [[ -n "$PANEL_HOST" ]]; then
+                def_sni="${prefix}.${PANEL_HOST}"
+                warn "Для TCP+TLS канала нужен уникальный домен (SNI)."
+                warn "Добавь у регистратора запись A: $def_sni → $SERVER_IP (или CNAME на $PANEL_HOST)."
+            else
+                warn "У панели нет домена (сертификат по IP). Укажи домен канала вручную."
+            fi
+            while true; do
+                ask "Домен канала (SNI, TCP+TLS)" "$def_sni" CHANNEL_SNI
+                [[ -n "$CHANNEL_SNI" ]] || die "Для TCP+TLS домен обязателен."
+                if [[ -n "$PANEL_HOST" && "$CHANNEL_SNI" == "$PANEL_HOST" ]]; then
+                    warn "SNI совпадает с доменом панели — канал будет недоступен (SSL конфликт)."
+                    continue
+                fi
+                if db_sni_in_use "$CHANNEL_SNI" tls; then
+                    warn "SNI $CHANNEL_SNI уже используется другим каналом."
+                    continue
+                fi
+                break
+            done
+            SNI="$CHANNEL_SNI"
+            ensure_channel_cert "$CHANNEL_SNI"
+            info "SNI канала: $SNI (сертификат: ${CHANNEL_CERT_DIR:-сертификат панели})."
+        else
+            SNI="${PANEL_HOST:-$(external_addr)}"
+            info "SNI для TLS: $SNI"
+        fi
     fi
     if [[ "$SECURITY" == "reality" ]]; then
-        ask "REALITY: целевой домен (target)" "yahoo.com" REALITY_SNI
+        if [[ "$TRANSPORT" == "tcp" ]]; then
+            while true; do
+                ask "REALITY: целевой домен (target)" "yahoo.com" REALITY_SNI
+                if db_sni_in_use "$REALITY_SNI" reality; then
+                    warn "Target $REALITY_SNI уже используется другим REALITY-каналом."
+                    warn "При одинаковом SNI stream-443 не сможет различить каналы."
+                    continue
+                fi
+                break
+            done
+        else
+            ask "REALITY: целевой домен (target)" "yahoo.com" REALITY_SNI
+        fi
         REALITY_TARGET="${REALITY_SNI}:443"
         REALITY_SPIDERX="/"
         gen_reality_keys
@@ -1839,15 +2553,25 @@ main() {
         echo "   2) Включить заглушку (панель скрыть на пути, корень → сайт)"
         echo "   3) Отключить заглушку (панель на корень)"
         echo "   4) Включить подписку пользователя (/sub/)"
+        echo "   5) Всё через 443 (stream-мастер)"
+        echo "   6) Удалить канал"
         echo "   0) Выход"
         echo "===================================="
         local ans=""
-        read -r -p "Ваш выбор [0-4]: " ans || exit 0
+        read -r -p "Ваш выбор [0-6]: " ans || exit 0
         case "$ans" in
             1) create_channel ;;
             2) setup_landing ;;
             3) disable_landing ;;
             4) setup_subscription ;;
+            5)
+                if is_stream_443_master; then
+                    ok "Stream-мастер уже включён: $(external_url "$PANEL_PATH")"
+                else
+                    nginx_stream_master_setup
+                fi
+                ;;
+            6) delete_channel ;;
             0|q|Q|exit) break ;;
             *) warn "Неверный выбор." ;;
         esac
