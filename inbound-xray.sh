@@ -1021,10 +1021,15 @@ COMMIT;" 2>/dev/null; then
         sqlite3 "$XUI_DB" "ROLLBACK;" 2>/dev/null || true
         die "Ошибка удаления канала (id=$id)."
     fi
-    local cid=""
+    # Статистика удаляемого канала: client_traffics связан по inbound_id
+    # (колонки client_id в этой таблице НЕТ — раньше удаление молча
+    # пропускалось и записи «6 активных клиентов» оставались в базе).
+    sqlite3 "$XUI_DB" "DELETE FROM client_traffics WHERE inbound_id = $id;" 2>/dev/null || true
+    local cid="" email=""
     for cid in $orphans; do
-        if db_has_table client_traffics; then
-            sqlite3 "$XUI_DB" "DELETE FROM client_traffics WHERE client_id = $cid;" 2>/dev/null || true
+        email="$(sqlite3 "$XUI_DB" "SELECT email FROM clients WHERE id = $cid;" 2>/dev/null || true)"
+        if db_has_table client_traffics && [[ -n "$email" ]]; then
+            sqlite3 "$XUI_DB" "DELETE FROM client_traffics WHERE email = '$(sql_escape "$email")';" 2>/dev/null || true
         fi
         sqlite3 "$XUI_DB" "DELETE FROM clients WHERE id = $cid;" 2>/dev/null || true
     done
@@ -1288,8 +1293,14 @@ link_external() {
             fi
             ;;
         tcp)
-            if [[ "$STREAM_443_MASTER" == "1" ]]; then
-                printf '%s:443' "${PANEL_HOST:-$(external_addr)}"
+            if [[ "$USE_NGINX" == "1" ]]; then
+                # За прокси: stream-мастер → внешний 443, иначе собственный порт
+                # (legacy-режим: nginx stream слушает внешний IP:PORT).
+                if [[ "$STREAM_443_MASTER" == "1" ]]; then
+                    printf '%s:443' "${PANEL_HOST:-$(external_addr)}"
+                else
+                    printf '%s:%s' "$(external_addr)" "$PORT"
+                fi
             else
                 printf '%s:%s' "$(external_addr)" "$PORT"
             fi
@@ -2275,10 +2286,11 @@ setup_landing() {
         fi
     fi
 
-    # Путь панели: если корень — переносим на /<путь>/
+    # Путь панели: если корень — переносим на случайный /<путь>/
+    info "Текущий путь панели (webBasePath): ${PANEL_PATH:-/}"
     if [[ -z "$PANEL_PATH" || "$PANEL_PATH" == "/" || "$PANEL_PATH" == "./" ]]; then
         local new_path=""
-        ask "Путь панели (на корне будет заглушка)" "panel" new_path
+        ask "Путь панели (Enter — случайный)" "$(gen_hex 10)" new_path
         set_panel_base_path "$new_path"
     else
         info "Панель уже на пути ${PANEL_PATH} — заглушка займёт корень."
@@ -2320,8 +2332,10 @@ setup_landing() {
 }
 
 # disable_landing — возвращает панель на корневой адрес.
+# Путь панели (webBasePath) при этом НЕ меняется — адрес панели остаётся
+# скрытым (раньше set_panel_base_path "" возвращал панель на корень, из-за
+# чего при повторном включении заглушки снова спрашивался путь панели).
 disable_landing() {
-    set_panel_base_path ""
     local conf="$NGINX_CONF"
     if [[ -z "$conf" || ! -f "$conf" ]]; then
         detect_nginx_conf
@@ -2330,7 +2344,7 @@ disable_landing() {
     [[ -z "$conf" || ! -f "$conf" ]] && conf="/etc/nginx/conf.d/x-ui.conf"
     write_panel_conf "$conf" panel || return 1
     ENABLE_LANDING=""
-    ok "Заглушка отключена. Панель: $(external_url "")"
+    ok "Заглушка отключена. Панель: $(external_url "$PANEL_PATH")"
 }
 
 # print_panel_data — повторный вывод данных панели (логин, пароль, адрес, токен).
@@ -2543,7 +2557,7 @@ create_channel() {
     case "$TRANSPORT" in
         ws|grpc|xhttp|httpupgrade)
             while true; do
-                ask "Путь (для nginx удобен формат /<цифры>/<name>)" "/$(gen_hex 4)/$(gen_hex 5)" WS_PATH
+                ask "Путь (для nginx нужен формат /<порт>/<name>)" "/${PORT}/$(gen_hex 5)" WS_PATH
                 if db_path_in_use "$WS_PATH"; then
                     warn "Путь $WS_PATH уже используется другим каналом за прокси."
                     confirm "Продолжить с тем же путём?" || continue
@@ -2627,7 +2641,7 @@ create_channel() {
     if command -v nginx >/dev/null 2>&1; then
         case "$TRANSPORT" in
             ws|grpc|xhttp|httpupgrade)
-                if confirm "Настроить nginx (proxy_pass для канала)?"; then
+                if confirm "Настроить nginx (proxy_pass для канала)?" y; then
                     USE_NGINX=1
                     LISTEN="127.0.0.1"
                     info "Канал будет слушать 127.0.0.1:${PORT} (за nginx)."
@@ -2638,14 +2652,14 @@ create_channel() {
         if [[ "$TRANSPORT" == "tcp" && "$PROTOCOL" != "mtproto" ]]; then
             case "$SECURITY" in
                 reality)
-                    if confirm "Настроить nginx stream-SNI (passthrough REALITY)?"; then
+                    if confirm "Настроить nginx stream-SNI (passthrough REALITY)?" y; then
                         USE_NGINX=1
                         LISTEN="127.0.0.1"
                         info "Канал будет слушать 127.0.0.1:${PORT} (за nginx stream)."
                     fi
                     ;;
                 tls)
-                    if confirm "Настроить nginx stream (TCP-passthrough для TLS-канала)?"; then
+                    if confirm "Настроить nginx stream (TCP-passthrough для TLS-канала)?" y; then
                         USE_NGINX=1
                         LISTEN="127.0.0.1"
                         info "Канал будет слушать 127.0.0.1:${PORT} (за nginx stream)."
@@ -2656,6 +2670,21 @@ create_channel() {
     fi
 
     # Сборка JSON и вставка
+    if [[ "$SECURITY" == "reality" ]]; then
+        # Target — свой сайт-прикрытие за nginx (панель/заглушка), как на
+        # эталоне 185; SNI клиентской ссылки остаётся внешним (yahoo.com).
+        # Без прокси — target внешний домен:443.
+        if [[ -n "$USE_NGINX" ]]; then
+            if [[ "$STREAM_443_MASTER" == "1" ]]; then
+                REALITY_TARGET="127.0.0.1:${PANEL_SSL_PORT:-8443}"
+            else
+                REALITY_TARGET="127.0.0.1:${PROXY_PORT:-8443}"
+            fi
+        else
+            REALITY_TARGET="${REALITY_SNI}:443"
+        fi
+        info "REALITY target: $REALITY_TARGET"
+    fi
     local settings_json stream_json snf_json
     settings_json="$(build_settings "$PROTOCOL" "$CLIENT_JSON" "$SS_METHOD")"
     if [[ -n "$USE_NGINX" && "$TRANSPORT" != "tcp" ]]; then
@@ -2694,10 +2723,9 @@ create_channel() {
         elif [[ "$TRANSPORT" == "tcp" && "$SECURITY" == "tls" ]]; then
             nginx_add_stream_tcp
         fi
-        # Внешний адрес/порт для подписки (запись в таблицу hosts)
-        if [[ "$SUB_ENABLE" == "true" ]]; then
-            db_add_host_record "$INBOUND_ID"
-        fi
+        # Внешний адрес/порт для подписки (запись в таблицу hosts) — всегда
+        # при канале за прокси, независимо от включённой подписки.
+        db_add_host_record "$INBOUND_ID"
     fi
 
     # Порт канала в firewall. Без прокси — прямой порт канала. С прокси в
@@ -2731,6 +2759,12 @@ main() {
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
     fi
+    # Подписка включается автоматически при первом запуске (без пункта меню)
+    if [[ "$SUB_ENABLE" != "true" ]]; then
+        setup_subscription
+    else
+        info "Подписка пользователя уже включена: $(sub_url "${CLIENT_SUBID:-<subId>}")"
+    fi
 
     while true; do
         banner ""
@@ -2738,26 +2772,24 @@ main() {
         echo "   1) Создать Xray-канал"
         echo "   2) Включить заглушку (панель скрыть на пути, корень → сайт)"
         echo "   3) Отключить заглушку (панель на корень)"
-        echo "   4) Включить подписку пользователя (/sub/)"
-        echo "   5) Всё через 443 (stream-мастер)"
-        echo "   6) Удалить канал"
+        echo "   4) Всё через 443 (stream-мастер)"
+        echo "   5) Удалить канал"
         echo "   0) Выход"
         echo "===================================="
         local ans=""
-        read -r -p "Ваш выбор [0-6]: " ans || exit 0
+        read -r -p "Ваш выбор [0-5]: " ans || exit 0
         case "$ans" in
             1) create_channel ;;
             2) setup_landing ;;
             3) disable_landing ;;
-            4) setup_subscription ;;
-            5)
+            4)
                 if is_stream_443_master; then
                     ok "Stream-мастер уже включён: $(external_url "$PANEL_PATH")"
                 else
                     nginx_stream_master_setup
                 fi
                 ;;
-            6) delete_channel ;;
+            5) delete_channel ;;
             0|q|Q|exit) break ;;
             *) warn "Неверный выбор." ;;
         esac
