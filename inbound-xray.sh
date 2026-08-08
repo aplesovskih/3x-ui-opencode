@@ -1662,6 +1662,33 @@ BLOCK
     ok "Добавлена regex-location в $NGINX_SNIPPET"
 }
 
+# nginx_ensure_snippet_included — подключает сниппет WS/gRPC regex-location'ов
+# в server-блок NGINX_CONF, если его там ещё нет. Иначе location'ы лежат
+# мёртвым грузом и WS-каналы за nginx возвращают 404.
+nginx_ensure_snippet_included() {
+    [[ -f "$NGINX_SNIPPET" ]] || return 0
+    [[ -f "$NGINX_CONF" ]] || return 0
+    if grep -Fqs "include ${NGINX_SNIPPET};" "$NGINX_CONF"; then
+        return 0
+    fi
+    local bak
+    bak="$(mktemp)"
+    cp -a "$NGINX_CONF" "$bak" || return 1
+    sed -i "/server_name _;/a\\    include ${NGINX_SNIPPET};" "$NGINX_CONF"
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
+        warn "nginx -t не прошёл — откат $NGINX_CONF."
+        warn "$NGINX_TEST_ERR"
+        cp -a "$bak" "$NGINX_CONF"
+        return 1
+    fi
+    rm -f "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    ok "Сниппет $NGINX_SNIPPET подключён в $NGINX_CONF"
+    return 0
+}
+
 # nginx_stream_listen — адрес listen для stream-правила канала. nginx слушает
 # на ВНЕШНЕМ IP (не 0.0.0.0), иначе он занимает порт целиком и xray не может
 # забиндиться на 127.0.0.1:PORT. Если IP не удалось определить — fallback на
@@ -2650,7 +2677,10 @@ create_channel() {
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
         case "$TRANSPORT" in
-            ws|grpc|xhttp|httpupgrade) nginx_add_http_location ;;
+            ws|grpc|xhttp|httpupgrade)
+                nginx_add_http_location
+                nginx_ensure_snippet_included
+                ;;
         esac
         if [[ "$TRANSPORT" == "tcp" && "$SECURITY" == "reality" ]]; then
             nginx_add_stream_sni
