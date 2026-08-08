@@ -1662,6 +1662,22 @@ BLOCK
     ok "Добавлена regex-location в $NGINX_SNIPPET"
 }
 
+# nginx_stream_listen — адрес listen для stream-правила канала. nginx слушает
+# на ВНЕШНЕМ IP (не 0.0.0.0), иначе он занимает порт целиком и xray не может
+# забиндиться на 127.0.0.1:PORT. Если IP не удалось определить — fallback на
+# «порт без адреса» (0.0.0.0) с предупреждением.
+nginx_stream_listen() {
+    if [[ -z "$SERVER_IP" ]]; then
+        detect_server_ip
+    fi
+    if [[ -n "$SERVER_IP" ]]; then
+        printf '%s:%s' "$SERVER_IP" "$PORT"
+    else
+        warn "Не удалось определить внешний IP: stream-правило займёт порт целиком (0.0.0.0), xray не сможет слушать 127.0.0.1:${PORT}."
+        printf '%s' "$PORT"
+    fi
+}
+
 # nginx_add_stream_sni — stream-SNI правило для REALITY/TCP-passthrough.
 nginx_add_stream_sni() {
     [[ -f "$NGINX_STREAM" ]] || return 0
@@ -1670,7 +1686,8 @@ nginx_add_stream_sni() {
         nginx_stream_master_rebuild
         return 0
     fi
-    local sni_block
+    local sni_block stream_listen
+    stream_listen="$(nginx_stream_listen)"
     sni_block=$(cat <<BLOCK
 
 # inbound-xray.sh: канал ${REMARK} (${PROTOCOL}, порт ${PORT})
@@ -1679,8 +1696,8 @@ map \$ssl_preread_server_name \$up_${PORT} {
 }
 
 server {
-    listen ${PORT};
-    listen ${PORT} udp;
+    listen ${stream_listen};
+    listen ${stream_listen} udp;
     proxy_pass \$up_${PORT};
     proxy_protocol off;
     ssl_preread on;
@@ -1712,17 +1729,18 @@ nginx_add_stream_tcp() {
         nginx_stream_master_rebuild
         return 0
     fi
-    if grep -Eqs "listen[[:space:]]+${PORT}[[:space:]]*(;|udp|$)" "$NGINX_STREAM" \
+    if grep -Eqs "listen[[:space:]]+([^:]+:)?${PORT}[[:space:]]*(;|$)" "$NGINX_STREAM" \
         && grep -Eqs "proxy_pass[[:space:]]+127\.0\.0\.1:${PORT}" "$NGINX_STREAM"; then
         info "stream-passthrough для порта ${PORT} уже настроен."
         return 0
     fi
-    local block
+    local block stream_listen
+    stream_listen="$(nginx_stream_listen)"
     block=$(cat <<BLOCK
 
 # inbound-xray.sh: канал ${REMARK} (${PROTOCOL}+${TRANSPORT}+${SECURITY}, порт ${PORT})
 server {
-    listen ${PORT};
+    listen ${stream_listen};
     proxy_pass 127.0.0.1:${PORT};
 }
 BLOCK
