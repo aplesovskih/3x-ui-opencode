@@ -1521,6 +1521,18 @@ MENU
 # nginx-интеграция
 # =============================================================================
 
+# nginx_test_ok — проверяет конфигурацию nginx (nginx -t). При провале
+# сохраняет текст ошибки в NGINX_TEST_ERR и возвращает 1.
+nginx_test_ok() {
+    NGINX_TEST_ERR=""
+    local out=""
+    out="$(nginx -t 2>&1)" || {
+        NGINX_TEST_ERR="$out"
+        return 1
+    }
+    return 0
+}
+
 # nginx_ensure_files — создаёт каталоги и пустые файлы сниппета и stream,
 # если их ещё нет. Без этого скрипт молча пропускал настройку прокси.
 nginx_ensure_files() {
@@ -1535,18 +1547,25 @@ nginx_ensure_files() {
 }
 
 # nginx_stream_context_enable — подключает stream-контекст в nginx.conf:
-# блок "stream { include .../stream-enabled/*.conf; }" на верхнем уровне.
-# С бэкапом и откатом при ошибке nginx -t.
+# блок "stream { include <NGINX_STREAM>; }" на верхнем уровне.
+# Включается КОНКРЕТНЫЙ файл скрипта (не glob *.conf), чтобы посторонние
+# файлы каталога не ломали nginx -t. С бэкапом и откатом при ошибке.
 nginx_stream_context_enable() {
     local nf="$NGINX_MAIN"
-    local dir_stream
-    dir_stream="$(dirname "$NGINX_STREAM")"
+    local inc_entry
+    inc_entry="include ${NGINX_STREAM};"
     [[ -f "$nf" ]] || { warn "Не найден $nf — stream-контекст не подключён."; return 1; }
     if grep -Eqs 'stream\s*\{' "$nf"; then
-        if ! grep -Eqs 'stream-enabled/\*\.conf' "$nf"; then
-            warn "$nf: stream-блок уже есть, но include stream-enabled/*.conf не найден."
+        if ! grep -Fqs "$inc_entry" "$nf"; then
+            warn "$nf: stream-блок уже есть, но include ${NGINX_STREAM} не найден."
         fi
         return 0
+    fi
+    # Базовый nginx -t ДО изменений: сломанный конфиг не трогаем.
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
+        warn "nginx -t не проходит и без наших изменений — stream-контекст не добавляю:"
+        warn "$NGINX_TEST_ERR"
+        return 1
     fi
     local bak
     bak="$(mktemp)"
@@ -1555,11 +1574,12 @@ nginx_stream_context_enable() {
         printf '\n'
         printf '%s\n' "# inbound-xray.sh: stream-контекст (REALITY/TLS passthrough и stream-мастер)"
         printf '%s\n' 'stream {'
-        printf '    include %s/*.conf;\n' "$dir_stream"
+        printf '    %s\n' "$inc_entry"
         printf '%s\n' '}'
     } >> "$nf"
-    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат nginx.conf."
+        warn "$NGINX_TEST_ERR"
         cp -a "$bak" "$nf"
         rm -f "$bak"
         return 1
@@ -1597,8 +1617,9 @@ BLOCK
     bak="$(mktemp)"
     cp -a "$NGINX_SNIPPET" "$bak" || return 1
     printf '%s\n' "$block" >> "$NGINX_SNIPPET" || { cp -a "$bak" "$NGINX_SNIPPET"; return 1; }
-    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат конфигурации."
+        warn "$NGINX_TEST_ERR"
         cp -a "$bak" "$NGINX_SNIPPET"
         return 1
     fi
@@ -1621,14 +1642,14 @@ nginx_add_stream_sni() {
     sni_block=$(cat <<BLOCK
 
 # inbound-xray.sh: канал ${REMARK} (${PROTOCOL}, порт ${PORT})
-map \$ssl_preread_server_name \${PORT}_upstream {
+map \$ssl_preread_server_name ${PORT}_upstream {
     default  127.0.0.1:${PORT};
 }
 
 server {
     listen ${PORT};
     listen ${PORT} udp;
-    proxy_pass \${PORT}_upstream;
+    proxy_pass ${PORT}_upstream;
     proxy_protocol off;
     ssl_preread on;
 }
@@ -1638,8 +1659,9 @@ BLOCK
     bak="$(mktemp)"
     cp -a "$NGINX_STREAM" "$bak" || return 1
     printf '%s\n' "$sni_block" >> "$NGINX_STREAM" || { cp -a "$bak" "$NGINX_STREAM"; return 1; }
-    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат конфигурации."
+        warn "$NGINX_TEST_ERR"
         cp -a "$bak" "$NGINX_STREAM"
         return 1
     fi
@@ -1677,8 +1699,9 @@ BLOCK
     bak="$(mktemp)"
     cp -a "$NGINX_STREAM" "$bak" || return 1
     printf '%s\n' "$block" >> "$NGINX_STREAM" || { cp -a "$bak" "$NGINX_STREAM"; return 1; }
-    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат конфигурации."
+        warn "$NGINX_TEST_ERR"
         cp -a "$bak" "$NGINX_STREAM"
         return 1
     fi
@@ -1763,8 +1786,9 @@ EOF
         rm -f "$tmp" "$bak"
         return 1
     fi
-    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат stream-конфигурации."
+        warn "$NGINX_TEST_ERR"
         cp -a "$bak" "$NGINX_STREAM"
         rm -f "$tmp" "$bak"
         return 1
@@ -1868,8 +1892,9 @@ EOF
         rm -f "$tmp" "$bak"
         return 1
     fi
-    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат stream-конфигурации."
+        warn "$NGINX_TEST_ERR"
         cp -a "$bak" "$NGINX_STREAM"
         rm -f "$tmp" "$bak"
         return 1
@@ -2505,7 +2530,6 @@ create_channel() {
     fi
 
     # nginx-интеграция
-    # nginx-интеграция
     USE_NGINX=""
     local can_proxy=""
     case "$TRANSPORT" in
@@ -2589,8 +2613,12 @@ create_channel() {
         fi
     fi
 
-    # Прямой порт канала (не за прокси) открываем в firewall
+    # Порт канала в firewall. Без прокси — прямой порт канала. С прокси в
+    # legacy-режиме (не stream-мастер) порт слушает nginx stream — тоже
+    # открываем. В stream-мастере снаружи открыт только 443.
     if [[ -z "$USE_NGINX" ]]; then
+        firewall_port_open "$PORT" "$CHANNEL_PROTO"
+    elif [[ "$STREAM_443_MASTER" != "1" && "$TRANSPORT" == "tcp" && ( "$SECURITY" == "reality" || "$SECURITY" == "tls" ) ]]; then
         firewall_port_open "$PORT" "$CHANNEL_PROTO"
     fi
 
