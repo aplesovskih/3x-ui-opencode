@@ -191,6 +191,32 @@ install_pkg() {
     esac
 }
 
+# nginx_pkg — пакет nginx с поддержкой stream. На Debian/Ubuntu это nginx-full
+# (включает динамический модуль stream и подключает его автоматически через
+# /etc/nginx/modules-enabled/), на RHEL-семействе — обычный nginx.
+nginx_pkg() {
+    [[ "$PKG_MANAGER" == "apt-get" ]] && echo "nginx-full" || echo "nginx"
+}
+
+# nginx_install_stream_module — если nginx не распознаёт директиву stream
+# (Ubuntu/Debian ставят nginx-core без stream), доустанавливает подходящий
+# пакет и повторяет проверку.
+nginx_install_stream_module() {
+    command -v nginx >/dev/null 2>&1 || return 1
+    if nginx_test_ok; then
+        return 0
+    fi
+    [[ "$NGINX_TEST_ERR" != *'unknown directive "stream"'* ]] && return 0
+    warn "nginx не поддерживает stream-контекст — устанавливаю $(nginx_pkg)..."
+    if ! install_pkg "$(nginx_pkg)"; then
+        warn "Не удалось установить $(nginx_pkg). Директиву stream нужно подключить вручную."
+        return 1
+    fi
+    command -v nginx >/dev/null 2>&1 || { warn "nginx не установился после замены пакета."; return 1; }
+    nginx_test_ok || { warn "nginx -t всё ещё не проходит:"; warn "$NGINX_TEST_ERR"; return 1; }
+    return 0
+}
+
 # ensure_tools <пакеты...> — проверяет наличие программ; при отсутствии
 # спрашивает «установить или выйти» и при согласии устанавливает.
 ensure_tools() {
@@ -1562,10 +1588,16 @@ nginx_stream_context_enable() {
         return 0
     fi
     # Базовый nginx -t ДО изменений: сломанный конфиг не трогаем.
+    # Если nginx не знает директиву stream (nginx-core) — доустанавливаем
+    # подходящий пакет (nginx-full/nginx-mod-stream).
     if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
-        warn "nginx -t не проходит и без наших изменений — stream-контекст не добавляю:"
-        warn "$NGINX_TEST_ERR"
-        return 1
+        if [[ "$NGINX_TEST_ERR" == *'unknown directive "stream"'* ]]; then
+            nginx_install_stream_module || return 1
+        else
+            warn "nginx -t не проходит и без наших изменений — stream-контекст не добавляю:"
+            warn "$NGINX_TEST_ERR"
+            return 1
+        fi
     fi
     local bak
     bak="$(mktemp)"
@@ -1642,14 +1674,14 @@ nginx_add_stream_sni() {
     sni_block=$(cat <<BLOCK
 
 # inbound-xray.sh: канал ${REMARK} (${PROTOCOL}, порт ${PORT})
-map \$ssl_preread_server_name ${PORT}_upstream {
+map \$ssl_preread_server_name \$up_${PORT} {
     default  127.0.0.1:${PORT};
 }
 
 server {
     listen ${PORT};
     listen ${PORT} udp;
-    proxy_pass ${PORT}_upstream;
+    proxy_pass \$up_${PORT};
     proxy_protocol off;
     ssl_preread on;
 }
@@ -2189,7 +2221,7 @@ setup_landing() {
     if ! command -v nginx >/dev/null 2>&1; then
         if confirm "nginx не установлен. Установить и настроить прокси панели?"; then
             info "Устанавливаем nginx..."
-            install_pkg nginx || die "Не удалось установить nginx."
+            install_pkg "$(nginx_pkg)" || die "Не удалось установить nginx."
             command -v nginx >/dev/null 2>&1 || die "nginx не установился."
             systemctl enable nginx >/dev/null 2>&1 || true
         else
@@ -2542,7 +2574,7 @@ create_channel() {
     if [[ -n "$can_proxy" ]] && ! command -v nginx >/dev/null 2>&1; then
         if confirm "nginx не установлен. Установить и использовать прокси для канала?"; then
             info "Устанавливаем nginx..."
-            install_pkg nginx || die "Не удалось установить nginx."
+            install_pkg "$(nginx_pkg)" || die "Не удалось установить nginx."
             command -v nginx >/dev/null 2>&1 || die "nginx не установился."
             systemctl enable nginx >/dev/null 2>&1 || true
         fi

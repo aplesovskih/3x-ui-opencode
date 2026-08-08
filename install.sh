@@ -486,7 +486,13 @@ choose_proxy() {
 # -----------------------------------------------------------------------------
 setup_nginx() {
     log "Устанавливаем nginx..."
-    install_pkg nginx
+    # Debian/Ubuntu: nginx-full включает stream-контекст, нужный для каналов
+    # REALITY/TLS за nginx; иначе nginx-core не понимает директиву stream.
+    if [ "$PKG_MANAGER" = "apt-get" ]; then
+        install_pkg nginx-full
+    else
+        install_pkg nginx
+    fi
 
     # Поддержка WebSocket-апгрейдов для панели
     cat > /etc/nginx/conf.d/websocket-upgrade.conf <<'EOF'
