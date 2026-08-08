@@ -1818,7 +1818,7 @@ nginx_stream_master_rebuild() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     local map_lines="" pass_lines="" row="" id="" port="" listen="" ss="" sni=""
     local rows="" sni_esc=""
-    rows="$(sqlite3 "$XUI_DB" "SELECT id, port, listen, stream_settings FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
+    rows="$(sqlite3 "$XUI_DB" "SELECT id, port, listen, replace(stream_settings, char(10), char(32)) FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
     while IFS= read -r row; do
         [[ -z "$row" ]] && continue
         id="${row%%|*}"; row="${row#*|}"
@@ -1949,7 +1949,7 @@ nginx_stream_rebuild_legacy() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     local blocks="" row="" port="" listen="" ss="" tmp bak
     local rows=""
-    rows="$(sqlite3 "$XUI_DB" "SELECT port, listen, stream_settings FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1' AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
+    rows="$(sqlite3 "$XUI_DB" "SELECT port, listen, replace(stream_settings, char(10), char(32)) FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1' AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
     while IFS= read -r row; do
         [[ -z "$row" ]] && continue
         port="${row%%|*}"; row="${row#*|}"
@@ -2613,6 +2613,7 @@ create_channel() {
         else
             ask "REALITY: целевой домен (target)" "yahoo.com" REALITY_SNI
         fi
+        SNI="$REALITY_SNI"
         REALITY_TARGET="${REALITY_SNI}:443"
         REALITY_SPIDERX="/"
         gen_reality_keys
