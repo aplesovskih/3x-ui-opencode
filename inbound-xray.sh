@@ -2658,7 +2658,14 @@ create_channel() {
     # Сборка JSON и вставка
     local settings_json stream_json snf_json
     settings_json="$(build_settings "$PROTOCOL" "$CLIENT_JSON" "$SS_METHOD")"
-    stream_json="$(build_stream "$TRANSPORT" "$SECURITY" "$WS_PATH" "$WS_HOST" "$SNI")"
+    if [[ -n "$USE_NGINX" && "$TRANSPORT" != "tcp" ]]; then
+        # Канал за nginx (ws/grpc/xhttp/httpupgrade): TLS терминируется на
+        # nginx, поэтому xray слушает на 127.0.0.1:PORT БЕЗ TLS.
+        info "Канал за nginx: TLS терминируется на nginx, xray слушает без TLS."
+        stream_json="$(build_stream "$TRANSPORT" "none" "$WS_PATH" "$WS_HOST" "$SNI")"
+    else
+        stream_json="$(build_stream "$TRANSPORT" "$SECURITY" "$WS_PATH" "$WS_HOST" "$SNI")"
+    fi
 
     if [[ "$PROTOCOL" == "hysteria" ]]; then
         snf_json="$(sniffing_json 0)"
