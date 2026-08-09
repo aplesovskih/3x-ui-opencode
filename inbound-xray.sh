@@ -1632,33 +1632,55 @@ nginx_stream_context_enable() {
 }
 
 # nginx_add_http_location — универсальный location для WS/gRPC/XHTTP/HTTPUpgrade.
+# gRPC обязательно идёт через grpc_pass (HTTP/2, иначе xray отвечает 404/разрыв),
+# WS/HTTPUpgrade и обычные GET/POST/PUT — через proxy_pass HTTP/1.1.
+# Схема повторяет x-ui-pro (mozaroc): buffering off нужен для потоковых транспортов.
 nginx_add_http_location() {
     [[ -f "$NGINX_SNIPPET" ]] || return 0
-    # Регекс-локация уже есть? (path вида /<порт>/...)
-    if grep -Eqs 'location ~ \^/\(\[0-9\]' "$NGINX_SNIPPET"; then
-        info "Универсальная regex-location в nginx уже настроена."
+    if grep -Fqs 'grpc_pass grpc://127.0.0.1:$fwdport;' "$NGINX_SNIPPET"; then
+        info "Универсальная regex-location (grpc_pass) уже настроена."
         return 0
     fi
     local block
-    block=$(cat <<BLOCK
+    block=$(cat <<'BLOCK'
 
-    # inbound-xray.sh: канал ${REMARK} (${PROTOCOL}+${TRANSPORT}, порт ${PORT})
-    location ~ ^/([0-9]+)/(.*)$ {
-        proxy_pass http://127.0.0.1:\$1;
+    # inbound-xray.sh: универсальная regex-location WS/gRPC/XHTTP/HTTPUpgrade
+    # Именованные capture (?<fwdport>...) — позиционные $1 внутри if не работают.
+    location ~ ^/(?<fwdport>[0-9]+)/(?<fwdpath>.*)$ {
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_socket_keepalive on;
+        proxy_read_timeout 1d;
+        grpc_read_timeout 1d;
+        grpc_socket_keepalive on;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        if ($content_type ~* "grpc") {
+            grpc_pass grpc://127.0.0.1:$fwdport;
+            break;
+        }
+        if ($http_upgrade ~* "(websocket|ws)") {
+            proxy_pass http://127.0.0.1:$fwdport;
+            break;
+        }
+        if ($request_method ~* ^(PUT|POST|GET)$) {
+            proxy_pass http://127.0.0.1:$fwdport;
+            break;
+        }
     }
 BLOCK
 )
     local bak
     bak="$(mktemp)"
     cp -a "$NGINX_SNIPPET" "$bak" || return 1
+    # Удаляем старые (HTTP/1.1) regex-location блоки, чтобы не было дублей.
+    if grep -Eqs 'location ~ \^/\(\[0-9\]' "$NGINX_SNIPPET"; then
+        sed -i '/location ~ \^\/\(\[0-9\]\+\)\/\(\.\*\)\$/,/^[[:space:]]*}$/d' "$NGINX_SNIPPET"
+    fi
     printf '%s\n' "$block" >> "$NGINX_SNIPPET" || { cp -a "$bak" "$NGINX_SNIPPET"; return 1; }
     if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
         warn "nginx -t не прошёл — откат конфигурации."
@@ -1670,7 +1692,7 @@ BLOCK
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
         systemctl reload nginx >/dev/null 2>&1 && ok "nginx перезагружен."
     fi
-    ok "Добавлена regex-location в $NGINX_SNIPPET"
+    ok "Добавлена универсальная regex-location (grpc_pass + buffering off) в $NGINX_SNIPPET"
 }
 
 # nginx_ensure_snippet_included — подключает сниппет WS/gRPC regex-location'ов
@@ -1698,6 +1720,54 @@ nginx_ensure_snippet_included() {
     fi
     ok "Сниппет $NGINX_SNIPPET подключён в $NGINX_CONF"
     return 0
+}
+
+# nginx_reality_target_server — внутренний https-сервер 127.0.0.1:9443
+# (заглушка) для REALITY target. TLS на сертификате поддомена REALITY, как в
+# эталоне x-ui-pro (mozaroc): target = фейковый сайт на своём же поддомене.
+nginx_reality_target_server() {
+    local sni="${1:-$CHANNEL_SNI}" port="${REALITY_TARGET_PORT:-9443}"
+    [[ -n "$sni" ]] || return 0
+    ensure_channel_cert "$sni"
+    local dir="${CHANNEL_CERT_DIR:-/root/cert/inbounds/${sni}}"
+    local cert="$dir/fullchain.pem" key="$dir/privkey.pem"
+    local conf="/etc/nginx/conf.d/reality-target.conf"
+    if [[ ! -f "$cert" || ! -f "$key" ]]; then
+        warn "Нет сертификата $sni — target-заглушка будет без TLS."
+        cert=""; key=""
+    fi
+    mkdir -p "$LANDING_DIR"
+    if [[ ! -f "$LANDING_INDEX" ]]; then
+        printf '%s\n' '<!doctype html><html><head><meta charset="utf-8"><title>It works</title></head><body><h1>It works!</h1></body></html>' > "$LANDING_INDEX"
+    fi
+    local bak
+    bak="$(mktemp)"
+    if [[ -f "$conf" ]]; then cp -a "$conf" "$bak"; fi
+    {
+        printf '%s\n' "# inbound-xray.sh: REALITY target-заглушка (127.0.0.1:${port}, ${sni})"
+        printf '%s\n' "server {"
+        printf '    listen 127.0.0.1:%s ssl;\n' "$port"
+        printf '    server_name %s;\n' "$sni"
+        printf '    root %s;\n' "$LANDING_DIR"
+        printf '%s\n' '    index index.html;'
+        if [[ -n "$cert" ]]; then
+            printf '    ssl_certificate %s;\n' "$cert"
+            printf '    ssl_certificate_key %s;\n' "$key"
+        fi
+        printf '%s\n' '    ssl_protocols TLSv1.2 TLSv1.3;'
+        printf '%s\n' '}'
+    } > "$conf"
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
+        warn "nginx -t не прошёл — откат reality-target.conf."
+        warn "$NGINX_TEST_ERR"
+        if [[ -f "$bak" ]]; then cp -a "$bak" "$conf"; else rm -f "$conf"; fi
+        return 1
+    fi
+    rm -f "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    ok "REALITY target-заглушка: https://127.0.0.1:${port} (${sni})."
 }
 
 # nginx_stream_listen — адрес listen для stream-правила канала. nginx слушает
@@ -2164,13 +2234,13 @@ write_panel_conf() {
     local listen_dir="    listen ${PROXY_PORT};"
     local ssl_lines=""
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
-        listen_dir="    listen 127.0.0.1:${PANEL_SSL_PORT} ssl;"
+        listen_dir="    listen 127.0.0.1:${PANEL_SSL_PORT} ssl http2;"
         if [[ -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
             ssl_lines="    ssl_certificate     ${PANEL_CERT};
     ssl_certificate_key ${PANEL_CERT_KEY};"
         fi
     elif [[ "$PROXY_SCHEME" == "https" && -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
-        listen_dir="    listen ${PROXY_PORT} ssl;"
+        listen_dir="    listen ${PROXY_PORT} ssl http2;"
         ssl_lines="    ssl_certificate     ${PANEL_CERT};
     ssl_certificate_key ${PANEL_CERT_KEY};"
     fi
@@ -2600,25 +2670,30 @@ create_channel() {
         fi
     fi
     if [[ "$SECURITY" == "reality" ]]; then
-        if [[ "$TRANSPORT" == "tcp" ]]; then
-            while true; do
-                ask "REALITY: целевой домен (target)" "yahoo.com" REALITY_SNI
-                if db_sni_in_use "$REALITY_SNI" reality; then
-                    warn "Target $REALITY_SNI уже используется другим REALITY-каналом."
-                    warn "При одинаковом SNI stream-443 не сможет различить каналы."
-                    continue
-                fi
-                break
-            done
-        else
-            ask "REALITY: целевой домен (target)" "yahoo.com" REALITY_SNI
-        fi
+        # Поддомен REALITY запрашивается интерактивно (как и в x-ui-pro mozaroc):
+        # на него должна указывать A-запись, он служит SNI маскировки клиента и
+        # serverNames инбаунда. Хардкодом домены в скрипте не фиксируются.
+        while true; do
+            ask "Поддомен REALITY (SNI маскировки, A-запись → сервер, напр. v.example.com)" "" CHANNEL_SNI
+            [[ -n "$CHANNEL_SNI" ]] || { warn "Поддомен REALITY обязателен."; continue; }
+            if [[ -n "$PANEL_HOST" && "$CHANNEL_SNI" == "$PANEL_HOST" ]]; then
+                warn "SNI совпадает с доменом панели — REALITY не сможет маскироваться."
+                continue
+            fi
+            if db_sni_in_use "$CHANNEL_SNI" reality; then
+                warn "SNI $CHANNEL_SNI уже используется другим REALITY-каналом."
+                warn "При одинаковом SNI stream-443 не сможет различить каналы."
+                continue
+            fi
+            break
+        done
+        REALITY_SNI="$CHANNEL_SNI"
         SNI="$REALITY_SNI"
-        REALITY_TARGET="${REALITY_SNI}:443"
+        REALITY_TARGET="127.0.0.1:9443"
         REALITY_SPIDERX="/"
         gen_reality_keys
         REALITY_SETTINGS_JSON="$(reality_settings "$REALITY_TARGET" "$REALITY_SNI")"
-        info "REALITY ключи сгенерированы."
+        info "REALITY: поддомен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
     fi
 
     # nginx-интеграция
@@ -2672,18 +2747,15 @@ create_channel() {
 
     # Сборка JSON и вставка
     if [[ "$SECURITY" == "reality" ]]; then
-        # Target — свой сайт-прикрытие за nginx (панель/заглушка), как на
-        # эталоне 185; SNI клиентской ссылки остаётся внешним (yahoo.com).
-        # Без прокси — target внешний домен:443.
+        # Target — сайт-прикрытие: за nginx это локальная заглушка 127.0.0.1:9443
+        # (nginx http-сервер с сертификатом поддомена REALITY), как в эталоне
+        # x-ui-pro. Без прокси — внешний домен поддомена:443.
         if [[ -n "$USE_NGINX" ]]; then
-            if [[ "$STREAM_443_MASTER" == "1" ]]; then
-                REALITY_TARGET="127.0.0.1:${PANEL_SSL_PORT:-8443}"
-            else
-                REALITY_TARGET="127.0.0.1:${PROXY_PORT:-8443}"
-            fi
+            REALITY_TARGET="127.0.0.1:9443"
         else
             REALITY_TARGET="${REALITY_SNI}:443"
         fi
+        REALITY_SETTINGS_JSON="$(reality_settings "$REALITY_TARGET" "$REALITY_SNI")"
         info "REALITY target: $REALITY_TARGET"
     fi
     local settings_json stream_json snf_json
@@ -2721,6 +2793,7 @@ create_channel() {
         esac
         if [[ "$TRANSPORT" == "tcp" && "$SECURITY" == "reality" ]]; then
             nginx_add_stream_sni
+            nginx_reality_target_server "$CHANNEL_SNI"
         elif [[ "$TRANSPORT" == "tcp" && "$SECURITY" == "tls" ]]; then
             nginx_add_stream_tcp
         fi
