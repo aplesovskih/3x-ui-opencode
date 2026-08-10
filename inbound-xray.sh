@@ -573,24 +573,20 @@ db_sni_in_use() {
 
 # --- Работа с firewall ------------------------------------------------------------
 
-# firewall_port_open <порт> <tcp|udp|both> — открывает порт в активном firewall.
+# firewall_port_open <порт> <tcp|udp> — открывает порт в активном firewall.
+# Только фактический протокол канала (tcp или udp), «both» не используется.
 # Если firewall (ufw/firewalld) не активен — только предупреждение.
 firewall_port_open() {
     local port="$1" proto="${2:-tcp}"
+    case "$proto" in
+        tcp|udp) ;;
+        *) proto="tcp" ;;
+    esac
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        case "$proto" in
-            tcp)  ufw allow "${port}"/tcp >/dev/null ;;
-            udp)  ufw allow "${port}"/udp >/dev/null ;;
-            both) ufw allow "${port}"/tcp >/dev/null; ufw allow "${port}"/udp >/dev/null ;;
-        esac
+        ufw allow "${port}"/"${proto}" >/dev/null
         ok "ufw: открыт порт ${port}/${proto}."
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        case "$proto" in
-            tcp)  firewall-cmd --permanent --add-port="${port}"/tcp >/dev/null ;;
-            udp)  firewall-cmd --permanent --add-port="${port}"/udp >/dev/null ;;
-            both) firewall-cmd --permanent --add-port="${port}"/tcp >/dev/null
-                  firewall-cmd --permanent --add-port="${port}"/udp >/dev/null ;;
-        esac
+        firewall-cmd --permanent --add-port="${port}"/"${proto}" >/dev/null
         firewall-cmd --reload >/dev/null
         ok "firewalld: открыт порт ${port}/${proto}."
     else
@@ -598,27 +594,23 @@ firewall_port_open() {
     fi
 }
 
-# firewall_port_close <порт> <tcp|udp|both> — закрывает порт в активном firewall.
-firewall_port_close() {
+# firewall_port_remove <порт> <tcp|udp> — удаляет ранее созданное правило
+# (allow) в активном firewall, а не добавляет deny.
+firewall_port_remove() {
     local port="$1" proto="${2:-tcp}"
+    case "$proto" in
+        tcp|udp) ;;
+        *) proto="tcp" ;;
+    esac
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        case "$proto" in
-            tcp)  ufw deny "${port}"/tcp >/dev/null ;;
-            udp)  ufw deny "${port}"/udp >/dev/null ;;
-            both) ufw deny "${port}"/tcp >/dev/null; ufw deny "${port}"/udp >/dev/null ;;
-        esac
-        ok "ufw: закрыт порт ${port}/${proto}."
+        ufw delete allow "${port}"/"${proto}" >/dev/null
+        ok "ufw: удалено правило ${port}/${proto}."
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        case "$proto" in
-            tcp)  firewall-cmd --permanent --remove-port="${port}"/tcp >/dev/null ;;
-            udp)  firewall-cmd --permanent --remove-port="${port}"/udp >/dev/null ;;
-            both) firewall-cmd --permanent --remove-port="${port}"/tcp >/dev/null
-                  firewall-cmd --permanent --remove-port="${port}"/udp >/dev/null ;;
-        esac
+        firewall-cmd --permanent --remove-port="${port}"/"${proto}" >/dev/null
         firewall-cmd --reload >/dev/null
-        ok "firewalld: закрыт порт ${port}/${proto}."
+        ok "firewalld: удалено правило ${port}/${proto}."
     else
-        warn "Активный firewall (ufw/firewalld) не обнаружен — порт ${port}/${proto} не закрыт."
+        warn "Активный firewall (ufw/firewalld) не обнаружен — правило ${port}/${proto} не удалено."
     fi
 }
 
@@ -1957,19 +1949,45 @@ EOF
     fi
 }
 
-# nginx_stream_master_setup — включает режим stream-мастера на 443.
+# nginx_stream_master_setup [auto] — включает режим stream-мастера на 443.
+# В режиме auto (автозапуск при старте скрипта) не задаёт вопросов и не
+# прерывает скрипт: при любом препятствии предупреждает и возвращает 1
+# (скрипт продолжает работу в legacy-режиме).
 nginx_stream_master_setup() {
-    command -v nginx >/dev/null 2>&1 || die "nginx не установлен — stream-мастер невозможен."
-    nginx_ensure_files || die "Не удалось подготовить файлы nginx."
-    nginx_stream_context_enable || die "Не удалось подключить stream-контекст."
-    stream_ssl_preread_ok || die "В nginx нет модуля stream_ssl_preread (нужен nginx-full/extra)."
+    local auto="$1" soft=""
+    [[ "$auto" == "auto" ]] && soft=1
+    if ! command -v nginx >/dev/null 2>&1; then
+        warn "nginx не установлен — stream-мастер невозможен."
+        [[ -n "$soft" ]] && return 1
+        die "nginx не установлен — stream-мастер невозможен."
+    fi
+    if ! nginx_ensure_files; then
+        warn "Не удалось подготовить файлы nginx."
+        [[ -n "$soft" ]] && return 1
+        die "Не удалось подготовить файлы nginx."
+    fi
+    if ! nginx_stream_context_enable; then
+        warn "Не удалось подключить stream-контекст."
+        [[ -n "$soft" ]] && return 1
+        die "Не удалось подключить stream-контекст."
+    fi
+    if ! stream_ssl_preread_ok; then
+        warn "В nginx нет модуля stream_ssl_preread (нужен nginx-full/extra)."
+        [[ -n "$soft" ]] && return 1
+        die "В nginx нет модуля stream_ssl_preread (нужен nginx-full/extra)."
+    fi
     if port_in_use "${STREAM_MASTER_PORT:-443}" tcp && ! is_stream_443_master; then
         warn "Порт ${STREAM_MASTER_PORT:-443} занят другим процессом."
+        if [[ -n "$soft" ]]; then
+            warn "Продолжаем без stream-мастера (каналы будут на своих портах)."
+            return 1
+        fi
         confirm "Продолжить (порт будет перехвачен nginx)?" || return 1
     fi
     if [[ "$PANEL_PORT" == "${STREAM_MASTER_PORT:-443}" ]]; then
         warn "Панель слушает на 443. Перенеси её на внутренний порт:"
         warn "  x-ui setting -port 2053 && systemctl restart x-ui"
+        [[ -n "$soft" ]] && return 1
         die "Невозможно занять 443 для stream-мастера."
     fi
     if [[ -z "$PANEL_SSL_PORT" ]]; then
@@ -1977,7 +1995,11 @@ nginx_stream_master_setup() {
     fi
     if port_in_use "$PANEL_SSL_PORT" tcp; then
         local alt=""
-        next_free_port alt tcp 8500 8999 || die "Нет свободного внутреннего порта."
+        if ! next_free_port alt tcp 8500 8999; then
+            warn "Нет свободного внутреннего порта."
+            [[ -n "$soft" ]] && return 1
+            die "Нет свободного внутреннего порта."
+        fi
         PANEL_SSL_PORT="$alt"
     fi
     info "Внутренний https-порт nginx (панель + WS/gRPC): 127.0.0.1:${PANEL_SSL_PORT}"
@@ -2089,14 +2111,34 @@ delete_channel() {
         info "Отменено."
         return 0
     fi
+    # Определяем, выходил ли канал через 443 (правило в firewall не создавалось)
+    # и по какому фактическому протоколу (tcp/udp) он работал — до удаления.
+    local del_ss="" del_listen="" del_cproto="tcp" del_remove=0
+    del_ss="$(sqlite3 "$XUI_DB" "SELECT replace(COALESCE(stream_settings,''),char(10),char(32)) FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
+    del_listen="$(sqlite3 "$XUI_DB" "SELECT COALESCE(listen,'') FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
+    case "$del_proto" in
+        hysteria*|wireguard) del_cproto="udp" ;;
+    esac
+    printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"kcp"' && del_cproto="udp"
+    # Через 443 идут каналы за nginx с http-транспортом (ws/grpc/xhttp/
+    # httpupgrade) — для них правило не создавалось, удалять нечего.
+    if [[ "$del_listen" != "127.0.0.1" ]]; then
+        del_remove=1
+    elif printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"tcp"'; then
+        # tcp+reality/tls за nginx в legacy слушал свой passthrough-порт
+        del_remove=1
+    fi
     db_delete_inbound "$del_id"
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
         nginx_stream_master_rebuild
     else
         nginx_stream_rebuild_legacy
     fi
-    firewall_port_close "$del_port" tcp 2>/dev/null || true
-    firewall_port_close "$del_port" udp 2>/dev/null || true
+    # Удаляем только существующее allow-правило (не добавляем deny),
+    # и только для каналов, выходивших не через 443.
+    if [[ "$del_remove" == "1" ]]; then
+        firewall_port_remove "$del_port" "$del_cproto" 2>/dev/null || true
+    fi
     restart_xui
     ok "Канал «$del_remark» удалён."
 }
@@ -2568,7 +2610,7 @@ create_channel() {
 
     # Протокол порта (UDP для hysteria/wireguard и транспорта kcp)
     case "$PROTOCOL" in
-        hysteria|wireguard) CHANNEL_PROTO="udp" ;;
+        hysteria*|wireguard) CHANNEL_PROTO="udp" ;;
         *) CHANNEL_PROTO="tcp" ;;
     esac
     [[ "$TRANSPORT" == "kcp" ]] && CHANNEL_PROTO="udp"
@@ -2696,7 +2738,8 @@ create_channel() {
         info "REALITY: поддомен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
     fi
 
-    # nginx-интеграция
+    # nginx-интеграция: все проксируемые каналы ВСЕГДА за 443 (stream-мастер),
+    # без вопросов. Если nginx не установлен — устанавливаем автоматически.
     USE_NGINX=""
     local can_proxy=""
     case "$TRANSPORT" in
@@ -2705,43 +2748,21 @@ create_channel() {
             [[ "$PROTOCOL" != "mtproto" && ( "$SECURITY" == "reality" || "$SECURITY" == "tls" ) ]] && can_proxy=1
             ;;
     esac
-    # Если nginx не установлен — предложить установить и использовать прокси
-    if [[ -n "$can_proxy" ]] && ! command -v nginx >/dev/null 2>&1; then
-        if confirm "nginx не установлен. Установить и использовать прокси для канала?"; then
-            info "Устанавливаем nginx..."
-            install_pkg "$(nginx_pkg)" || die "Не удалось установить nginx."
-            command -v nginx >/dev/null 2>&1 || die "nginx не установился."
-            systemctl enable nginx >/dev/null 2>&1 || true
+    if [[ -n "$can_proxy" ]]; then
+        if ! command -v nginx >/dev/null 2>&1; then
+            info "nginx не установлен — устанавливаем для прокси канала за 443..."
+            install_pkg "$(nginx_pkg)" || warn "Не удалось установить nginx — канал будет создан напрямую."
+            command -v nginx >/dev/null 2>&1 && systemctl enable nginx >/dev/null 2>&1 || true
         fi
-    fi
-    if command -v nginx >/dev/null 2>&1; then
-        case "$TRANSPORT" in
-            ws|grpc|xhttp|httpupgrade)
-                if confirm "Настроить nginx (proxy_pass для канала)?" y; then
-                    USE_NGINX=1
-                    LISTEN="127.0.0.1"
-                    info "Канал будет слушать 127.0.0.1:${PORT} (за nginx)."
-                fi
-                ;;
-        esac
-        # TCP-passthrough для TLS-каналов (VMess/VLESS/Trojan/TCP) и REALITY
-        if [[ "$TRANSPORT" == "tcp" && "$PROTOCOL" != "mtproto" ]]; then
-            case "$SECURITY" in
-                reality)
-                    if confirm "Настроить nginx stream-SNI (passthrough REALITY)?" y; then
-                        USE_NGINX=1
-                        LISTEN="127.0.0.1"
-                        info "Канал будет слушать 127.0.0.1:${PORT} (за nginx stream)."
-                    fi
-                    ;;
-                tls)
-                    if confirm "Настроить nginx stream (TCP-passthrough для TLS-канала)?" y; then
-                        USE_NGINX=1
-                        LISTEN="127.0.0.1"
-                        info "Канал будет слушать 127.0.0.1:${PORT} (за nginx stream)."
-                    fi
-                    ;;
-            esac
+        if command -v nginx >/dev/null 2>&1; then
+            USE_NGINX=1
+            LISTEN="127.0.0.1"
+            # Автоматически переводим весь трафик на 443 (stream-мастер),
+            # если он ещё не включён (например, сразу после установки nginx).
+            if ! is_stream_443_master; then
+                nginx_stream_master_setup auto
+            fi
+            info "Канал будет слушать 127.0.0.1:${PORT} (за nginx на 443)."
         fi
     fi
 
@@ -2802,9 +2823,11 @@ create_channel() {
         db_add_host_record "$INBOUND_ID"
     fi
 
-    # Порт канала в firewall. Без прокси — прямой порт канала. С прокси в
-    # legacy-режиме (не stream-мастер) порт слушает nginx stream — тоже
-    # открываем. В stream-мастере снаружи открыт только 443.
+    # Порт канала в firewall — только если канал выходит НЕ через 443.
+    # Без прокси — прямой порт канала. В legacy-режиме (мастер не удалось
+    # включить) tcp/reality/tls-каналы слушают свой passthrough-порт — тоже
+    # открываем. В stream-мастере снаружи открыт только 443 (открывается при
+    # включении мастера), порт канала не трогаем.
     if [[ -z "$USE_NGINX" ]]; then
         firewall_port_open "$PORT" "$CHANNEL_PROTO"
     elif [[ "$STREAM_443_MASTER" != "1" && "$TRANSPORT" == "tcp" && ( "$SECURITY" == "reality" || "$SECURITY" == "tls" ) ]]; then
@@ -2832,6 +2855,11 @@ main() {
     if command -v nginx >/dev/null 2>&1; then
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
+        # «Всё через 443» включается автоматически: stream-мастер на 443,
+        # все каналы и панель выходят наружу через единый 443.
+        if ! is_stream_443_master; then
+            nginx_stream_master_setup auto
+        fi
     fi
     # Подписка включается автоматически при первом запуске (без пункта меню)
     if [[ "$SUB_ENABLE" != "true" ]]; then
@@ -2846,24 +2874,16 @@ main() {
         echo "   1) Создать Xray-канал"
         echo "   2) Включить заглушку (панель скрыть на пути, корень → сайт)"
         echo "   3) Отключить заглушку (панель на корень)"
-        echo "   4) Всё через 443 (stream-мастер)"
-        echo "   5) Удалить канал"
+        echo "   4) Удалить канал"
         echo "   0) Выход"
         echo "===================================="
         local ans=""
-        read -r -p "Ваш выбор [0-5]: " ans || exit 0
+        read -r -p "Ваш выбор [0-4]: " ans || exit 0
         case "$ans" in
             1) create_channel ;;
             2) setup_landing ;;
             3) disable_landing ;;
-            4)
-                if is_stream_443_master; then
-                    ok "Stream-мастер уже включён: $(external_url "$PANEL_PATH")"
-                else
-                    nginx_stream_master_setup
-                fi
-                ;;
-            5) delete_channel ;;
+            4) delete_channel ;;
             0|q|Q|exit) break ;;
             *) warn "Неверный выбор." ;;
         esac
