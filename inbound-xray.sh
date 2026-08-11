@@ -999,6 +999,19 @@ db_has_table() {
     sqlite3 "$XUI_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='$1';" 2>/dev/null | grep -q "$1"
 }
 
+# db_list_clients — список клиентов для выбора при создании инбаунда:
+# каждая строка «id|email|протоколы_инбаундов» (протоколы — через запятую,
+# пусто, если у клиента нет инбаундов).
+db_list_clients() {
+    sqlite3 "$XUI_DB" "SELECT c.id, c.email,
+        COALESCE(GROUP_CONCAT(DISTINCT i.protocol), '')
+      FROM clients c
+      LEFT JOIN client_inbounds ci ON ci.client_id = c.id
+      LEFT JOIN inbounds i ON i.id = ci.inbound_id
+      GROUP BY c.id
+      ORDER BY c.email;" 2>/dev/null || true
+}
+
 # db_delete_inbound <id> — удаляет инбаунд: inbound, hosts, привязки клиентов;
 # клиенты, оставшиеся без инбаундов, удаляются вместе со своей статистикой.
 db_delete_inbound() {
@@ -2657,7 +2670,7 @@ create_channel() {
     INBOUND_ID=""; WS_PATH=""; WS_HOST=""; SNI=""; LISTEN=""
     SS_METHOD=""
     REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""; REALITY_SNI=""
-    CHANNEL_SNI=""; CHANNEL_CERT_DIR=""; REUSE_CLIENT=""; EXISTING_CLIENT_ID=""
+    CHANNEL_SNI=""; CHANNEL_CERT_DIR=""; REUSE_CLIENT=""; EXISTING_CLIENT_ID=""; CLIENT_SELECT=""
 
     menu_protocol
 
@@ -2701,26 +2714,65 @@ create_channel() {
 
     def_email="user-$(gen_hex 3)"
     def_subid="$(gen_hex 8)"
-    while true; do
-        ask "Email клиента" "$def_email" CLIENT_EMAIL
-        [[ -n "$CLIENT_EMAIL" ]] || die "Email клиента обязателен."
-        EXISTING_CLIENT_ID=""
-        if [[ "$PROTOCOL" != "http" && "$PROTOCOL" != "mixed" ]]; then
-            local cid="" plist=""
-            cid="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
-            if [[ -n "$cid" ]]; then
-                plist="$(sqlite3 "$XUI_DB" "SELECT DISTINCT i.protocol FROM client_inbounds ci JOIN inbounds i ON i.id = ci.inbound_id WHERE ci.client_id = $cid;" 2>/dev/null || true)"
-                if [[ -n "$plist" && "$plist" != "$PROTOCOL" ]]; then
-                    warn "Клиент «$CLIENT_EMAIL» уже есть, но его инбаунды — $plist (нужен $PROTOCOL)."
-                    warn "Переиспользование возможно только при совпадении протокола."
-                    continue
-                fi
+    EXISTING_CLIENT_ID=""
+    if [[ "$PROTOCOL" != "http" && "$PROTOCOL" != "mixed" ]]; then
+        # Существующие клиенты панели — предложить выбрать одного или создать нового
+        local rows=() i="" row="" cid="" cemail="" cproto=""
+        while true; do
+            mapfile -t rows < <(db_list_clients)
+            if (( ${#rows[@]} == 0 )); then
+                break
             fi
+            banner "Существующие клиенты панели:"
+            i=1
+            for row in "${rows[@]}"; do
+                IFS='|' read -r cid cemail cproto <<< "$row"
+                if [[ -n "$cproto" ]]; then
+                    echo "  $i) $cemail ($cproto)"
+                else
+                    echo "  $i) $cemail"
+                fi
+                i=$((i + 1))
+            done
+            echo "  0) Создать нового клиента"
+            ask "Выберите клиента (номер, 0 — новый)" "0" CLIENT_SELECT
+            if [[ -z "$CLIENT_SELECT" || "$CLIENT_SELECT" == "0" ]]; then
+                CLIENT_SELECT=""
+                break
+            fi
+            if ! [[ "$CLIENT_SELECT" =~ ^[0-9]+$ ]] || (( CLIENT_SELECT > ${#rows[@]} )); then
+                warn "Некорректный номер — выберите из списка."
+                continue
+            fi
+            row="${rows[$((CLIENT_SELECT - 1))]}"
+            IFS='|' read -r cid cemail cproto <<< "$row"
+            if [[ -n "$cproto" && "$cproto" != "$PROTOCOL" ]]; then
+                warn "Клиент «$cemail» используется в инбаундах: $cproto (нужен $PROTOCOL)."
+                warn "Переиспользование возможно только при совпадении протокола."
+                continue
+            fi
+            CLIENT_EMAIL="$cemail"
             EXISTING_CLIENT_ID="$cid"
-        fi
-        break
-    done
-    ask "Идентификатор подписки (subId)" "$def_subid" CLIENT_SUBID
+            CLIENT_SELECT=""
+            break
+        done
+    fi
+    if [[ -z "$EXISTING_CLIENT_ID" ]]; then
+        # Новый клиент: email уникален — проверить, что его ещё нет в базе
+        while true; do
+            ask "Email клиента" "$def_email" CLIENT_EMAIL
+            [[ -n "$CLIENT_EMAIL" ]] || die "Email клиента обязателен."
+            local dup=""
+            dup="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
+            if [[ -n "$dup" ]]; then
+                warn "Клиент «$CLIENT_EMAIL» уже есть в списке выше — выберите его номер или введите другой email."
+                def_email="user-$(gen_hex 3)"
+                continue
+            fi
+            break
+        done
+        ask "Идентификатор подписки (subId)" "$def_subid" CLIENT_SUBID
+    fi
 
     # Данные клиента: при переиспользовании берём существующие (не генерируем)
     if [[ -n "$EXISTING_CLIENT_ID" ]]; then
