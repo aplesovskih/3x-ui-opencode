@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# inbound-xray.sh — настройка Xray-каналов поверх установленной панели 3x-ui.
+# inbound-xray.sh — настройка Xray-инбаундов поверх установленной панели 3x-ui.
 #
 # Возможности:
 #   * создание inbound для всех поддерживаемых панелью протоколов/транспортов;
@@ -8,12 +8,12 @@
 #   * генерация share-ссылок (vless://, vmess://, trojan://, ss://, hy2://,
 #     wireguard://, tg://proxy);
 #   * опциональная интеграция с nginx (location для WS/gRPC/XHTTP/HTTPUpgrade,
-#     stream-SNI для REALITY, TCP-passthrough для TLS-каналов) с бэкапом и
+#     stream-SNI для REALITY, TCP-passthrough для TLS-инбаундов) с бэкапом и
 #     откатом при ошибке конфигурации;
 #   * заглушка-сайт на корневом адресе (панель скрывается на своём пути);
 #   * подписка пользователя (/sub/) через внешний адрес с корректными ссылками
-#     (записи в таблице hosts для каналов за прокси);
-#   * открытие прямых (непроксируемых) портов каналов в firewall;
+#     (записи в таблице hosts для инбаундов за прокси);
+#   * открытие прямых (непроксируемых) портов инбаундов в firewall;
 #   * автопроверка зависимостей (sqlite3, openssl, curl; опционально nginx):
 #     при отсутствии — вопрос «установить или выйти».
 #
@@ -91,7 +91,7 @@ REALITY_TARGET=""
 REALITY_SPIDERX="/"
 REALITY_SETTINGS_JSON=""
 
-# Параметры канала с уникальным SNI (TCP+TLS) и переиспользуемого клиента
+# Параметры инбаунда с уникальным SNI (TCP+TLS) и переиспользуемого клиента
 CHANNEL_SNI=""
 CHANNEL_CERT_DIR=""
 REUSE_CLIENT=""
@@ -409,9 +409,14 @@ gen_password() {
     openssl rand -base64 48 2>/dev/null | tr -d '[:space:]' | tr '+/' '-_' | cut -c1-"$len"
 }
 
-# psk для Shadowsocks-2022 (base64url из 32 байт, длина 43)
+# psk для Shadowsocks-2022: стандартный base64 32 байт (44 символа с '='
+# padding). Xray и панель декодируют ключ как base64.StdEncoding в ровно
+# 32 байта; base64url без padding (43 символа) ядро отвергает:
+# «illegal base64 data» при старте.
 gen_psk() {
-    openssl rand 32 | base64 | tr -d '=\n' | tr '+/' '-_'
+    local key
+    key="$(openssl rand 32 | base64 | tr -d '\n')"
+    printf '%s' "$key"
 }
 
 # x25519_keypair — пара ключей REALITY/WireGuard.
@@ -530,7 +535,7 @@ pick_port() {
         return $?
     fi
     if db_port_in_use "$answer"; then
-        warn "Порт $answer уже используется другим каналом в панели."
+        warn "Порт $answer уже используется другим инбаундом в панели."
         if confirm "Продолжить с занятым портом?"; then
             printf -v "$var" '%s' "$answer"
         else
@@ -547,20 +552,20 @@ db_port_in_use() {
     sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE port = $port LIMIT 1;" 2>/dev/null | grep -q .
 }
 
-# db_remark_in_use <remark> — есть ли канал с таким наименованием (remark).
+# db_remark_in_use <remark> — есть ли инбаунд с таким наименованием (remark).
 db_remark_in_use() {
     local remark="$1"
     sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE remark = '$(sql_escape "$remark")' LIMIT 1;" 2>/dev/null | grep -q .
 }
 
-# db_path_in_use <path> — используется ли путь другим каналом за прокси.
+# db_path_in_use <path> — используется ли путь другим инбаундом за прокси.
 db_path_in_use() {
     local path="$1"
     [[ -z "$path" || "$path" == "/" ]] && return 1
     sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE stream_settings LIKE '%\"path\": \"$(sql_escape "$path")\"%' LIMIT 1;" 2>/dev/null | grep -q .
 }
 
-# db_sni_in_use <sni> <tls|reality> — занят ли SNI другим каналом.
+# db_sni_in_use <sni> <tls|reality> — занят ли SNI другим инбаундом.
 # Для tls ищем "serverName", для reality — "serverNames" (массив).
 db_sni_in_use() {
     local sni="$1" kind="${2:-tls}"
@@ -574,7 +579,7 @@ db_sni_in_use() {
 # --- Работа с firewall ------------------------------------------------------------
 
 # firewall_port_open <порт> <tcp|udp> — открывает порт в активном firewall.
-# Только фактический протокол канала (tcp или udp), «both» не используется.
+# Только фактический протокол инбаунда (tcp или udp), «both» не используется.
 # Если firewall (ufw/firewalld) не активен — только предупреждение.
 firewall_port_open() {
     local port="$1" proto="${2:-tcp}"
@@ -748,7 +753,7 @@ build_settings() {
 
 # --- Сборка stream_settings ---------------------------------------------------------
 
-# tls_settings <serverName> — JSON tlsSettings. Для канала с уникальным SNI
+# tls_settings <serverName> — JSON tlsSettings. Для инбаунда с уникальным SNI
 # (TCP+TLS) используется его собственный сертификат из CHANNEL_CERT_DIR,
 # иначе — сертификат панели; при отсутствии — self-signed.
 tls_settings() {
@@ -761,13 +766,13 @@ tls_settings() {
     if [[ -n "$cert" && -n "$key" ]]; then
         printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$cert" "$key"
     else
-        printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "Сертификат не найден — будет выпущен self-signed для канала." >&2
+        printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "Сертификат не найден — будет выпущен self-signed для инбаунда." >&2
         gen_selfsigned_inbound_cert
         printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$PANEL_CERT" "$PANEL_CERT_KEY"
     fi
 }
 
-# gen_selfsigned_inbound_cert — выпускает self-signed сертификат для канала в
+# gen_selfsigned_inbound_cert — выпускает self-signed сертификат для инбаунда в
 # /etc/ssl/x-ui-inbound/<порт>/ (используется, когда у панели нет своего сертификата).
 gen_selfsigned_inbound_cert() {
     local dir="/etc/ssl/x-ui-inbound/chan"
@@ -795,7 +800,7 @@ cert_covers() {
     openssl x509 -in "$1" -noout -text 2>/dev/null | grep -Eq "DNS:${2}(,|$| )"
 }
 
-# issue_selfsigned_channel_cert <домен> — self-signed сертификат для канала
+# issue_selfsigned_channel_cert <домен> — self-signed сертификат для инбаунда
 # в /root/cert/inbounds/<домен>/ (запасной вариант, когда acme недоступен).
 issue_selfsigned_channel_cert() {
     local domain="$1" dir
@@ -812,10 +817,10 @@ issue_selfsigned_channel_cert() {
         || die "Не удалось выпустить self-signed сертификат для $domain."
     chmod 600 "$dir/privkey.pem"
     chmod 644 "$dir/fullchain.pem"
-    ok "Self-signed сертификат канала: $dir"
+    ok "Self-signed сертификат инбаунда: $dir"
 }
 
-# issue_domain_cert <домен> — сертификат канала через acme.sh (ZeroSSL, HTTP-01).
+# issue_domain_cert <домен> — сертификат инбаунда через acme.sh (ZeroSSL, HTTP-01).
 # Перед выпуском проверяет, что DNS уже резолвится на IP сервера.
 issue_domain_cert() {
     local domain="$1"
@@ -856,13 +861,13 @@ issue_domain_cert() {
         "$ACME_SH" --installcert --force -d "$domain" \
             --key-file "$CERT_DIR/privkey.pem" \
             --fullchain-file "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 || true
-        # При продлении acme.sh будет обновлять копии в каталоге канала
+        # При продлении acme.sh будет обновлять копии в каталоге инбаунда
         "$ACME_SH" --installcert --force -d "$domain" \
             --reloadcmd "mkdir -p '$CERT_DIR' && cp -f '$HOME/.acme.sh/${domain}/${domain}.key' '$CERT_DIR/privkey.pem' && cp -f '$HOME/.acme.sh/${domain}/fullchain.cer' '$CERT_DIR/fullchain.pem'" >/dev/null 2>&1 || true
         if [[ -f "$CERT_DIR/fullchain.pem" && -f "$CERT_DIR/privkey.pem" ]]; then
             chmod 600 "$CERT_DIR/privkey.pem"
             chmod 644 "$CERT_DIR/fullchain.pem"
-            ok "Выпущен сертификат канала для $domain."
+            ok "Выпущен сертификат инбаунда для $domain."
             return 0
         fi
     fi
@@ -870,9 +875,9 @@ issue_domain_cert() {
     return 1
 }
 
-# ensure_channel_cert <домен> — гарантирует наличие сертификата для канала.
+# ensure_channel_cert <домен> — гарантирует наличие сертификата для инбаунда.
 # Приоритет: сертификат панели (если покрывает домен) → существующий сертификат
-# канала → выпуск acme.sh (ZeroSSL) → self-signed.
+# инбаунда → выпуск acme.sh (ZeroSSL) → self-signed.
 ensure_channel_cert() {
     local domain="$1" dir
     dir="/root/cert/inbounds/${domain}"
@@ -882,17 +887,17 @@ ensure_channel_cert() {
         return 0
     fi
     if [[ -f "$dir/fullchain.pem" && -f "$dir/privkey.pem" ]]; then
-        ok "Сертификат канала уже есть: $dir"
+        ok "Сертификат инбаунда уже есть: $dir"
         CHANNEL_CERT_DIR="$dir"
         return 0
     fi
     CHANNEL_CERT_DIR="$dir"
     if confirm "Выпустить сертификат для $domain (acme.sh/ZeroSSL, нужна DNS-запись)?" "y"; then
         issue_domain_cert "$domain" \
-            && { ok "Сертификат канала готов: $dir"; return 0; }
+            && { ok "Сертификат инбаунда готов: $dir"; return 0; }
         warn "Выпуск не удался — используем self-signed (не рекомендуется для клиентов)."
     else
-        warn "Сертификат канала будет self-signed."
+        warn "Сертификат инбаунда будет self-signed."
     fi
     issue_selfsigned_channel_cert "$domain"
 }
@@ -994,8 +999,8 @@ db_has_table() {
     sqlite3 "$XUI_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='$1';" 2>/dev/null | grep -q "$1"
 }
 
-# db_delete_inbound <id> — удаляет канал: inbound, hosts, привязки клиентов;
-# клиенты, оставшиеся без каналов, удаляются вместе со своей статистикой.
+# db_delete_inbound <id> — удаляет инбаунд: inbound, hosts, привязки клиентов;
+# клиенты, оставшиеся без инбаундов, удаляются вместе со своей статистикой.
 db_delete_inbound() {
     local id="$1"
     local orphans=""
@@ -1011,9 +1016,9 @@ COMMIT;" 2>/dev/null; then
         :
     else
         sqlite3 "$XUI_DB" "ROLLBACK;" 2>/dev/null || true
-        die "Ошибка удаления канала (id=$id)."
+        die "Ошибка удаления инбаунда (id=$id)."
     fi
-    # Статистика удаляемого канала: client_traffics связан по inbound_id
+    # Статистика удаляемого инбаунда: client_traffics связан по inbound_id
     # (колонки client_id в этой таблице НЕТ — раньше удаление молча
     # пропускалось и записи «6 активных клиентов» оставались в базе).
     sqlite3 "$XUI_DB" "DELETE FROM client_traffics WHERE inbound_id = $id;" 2>/dev/null || true
@@ -1025,7 +1030,7 @@ COMMIT;" 2>/dev/null; then
         fi
         sqlite3 "$XUI_DB" "DELETE FROM clients WHERE id = $cid;" 2>/dev/null || true
     done
-    ok "Канал (id=$id) удалён из базы панели."
+    ok "Инбаунд (id=$id) удалён из базы панели."
 }
 
 # db_insert_inbound <settings_json> <stream_json> <sniffing_json> — вставка inbound.
@@ -1059,8 +1064,8 @@ SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в б
 # db_add_client_records <inbound_id> — таблицы clients/client_inbounds/client_traffics.
 # Работает только для протоколов с клиентами (не http/mixed).
 # load_existing_client <client_id> — заполняет CLIENT_* данными существующего
-# клиента. Источник: settings первого канала клиента с подходящим протоколом
-# (истинные данные, которые видит xray); если каналов нет (сирота) — таблица
+# клиента. Источник: settings первого инбаунда клиента с подходящим протоколом
+# (истинные данные, которые видит xray); если инбаундов нет (сирота) — таблица
 # clients. Сохраняет существующий subId клиента (иначе сломается подписка).
 load_existing_client() {
     local cid="$1" settings="" block="" inbound_id="" esc=""
@@ -1101,7 +1106,7 @@ load_existing_client() {
                 ;;
         esac
     else
-        # Сирота — каналов нет, берём поля из clients
+        # Сирота — инбаундов нет, берём поля из clients
         local row=""
         row="$(sqlite3 "$XUI_DB" "SELECT uuid, password, auth, flow, sub_id, secret, wg_private_key, wg_public_key FROM clients WHERE id = $cid;" 2>/dev/null || true)"
         local uu="" pw="" au="" fl="" se="" wgpk="" wgpub=""
@@ -1132,6 +1137,11 @@ db_add_client_records() {
     if [[ "$PROTOCOL" == "wireguard" ]]; then
         wg_pk="$CLIENT_PRIV"; wg_pub="$CLIENT_PUB"; wg_ips="10.0.0.2/32"; wg_ka="25"
     fi
+    # Колонка clients.password: панель для Shadowsocks берёт пароль клиента
+    # именно отсюда (в settings её пароль идёт в clients JSON, но при генерации
+    # конфига клиенты пересобираются из таблицы clients). Для SS — это CLIENT_PSK.
+    local cl_pw="$CLIENT_PW"
+    [[ "$PROTOCOL" == "shadowsocks" ]] && cl_pw="$CLIENT_PSK"
     # email уже есть в clients? (уникальность) — обновить, иначе вставить
     local existing
     existing="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
@@ -1139,14 +1149,14 @@ db_add_client_records() {
         cid="$existing"
         if [[ "$REUSE_CLIENT" == "1" ]]; then
             # Переиспользуемый клиент: протокол-поля (uuid/password/auth/flow/
-            # secret/wg_*) НЕ перезаписываем — иначе сломаются старые каналы,
+            # secret/wg_*) НЕ перезаписываем — иначе сломаются старые инбаунды,
             # где в settings сохранены прежние значения.
             :
         else
             local upd
             upd="sub_id = '$(sql_escape "$CLIENT_SUBID")',
                 uuid = '$(sql_escape "$CLIENT_ID")',
-                password = '$(sql_escape "$CLIENT_PW")',
+                password = '$(sql_escape "$cl_pw")',
                 auth = '$(sql_escape "$CLIENT_AUTH")',
                 flow = '$(sql_escape "$CLIENT_FLOW")',
                 security = 'auto',
@@ -1173,7 +1183,7 @@ db_add_client_records() {
              limit_ip, total_gb, expiry_time, enable, tg_id, group_name,
              comment, reset"
         vals="('$(sql_escape "$CLIENT_EMAIL")', '$(sql_escape "$CLIENT_SUBID")', '$(sql_escape "$CLIENT_ID")',
-             '$(sql_escape "$CLIENT_PW")', '$(sql_escape "$CLIENT_AUTH")', '$(sql_escape "$CLIENT_FLOW")',
+             '$(sql_escape "$cl_pw")', '$(sql_escape "$CLIENT_AUTH")', '$(sql_escape "$CLIENT_FLOW")',
              'auto', '',
              0, 0, 0, 1, 0, '',
              '', 0"
@@ -1274,7 +1284,7 @@ sha256_first() {
 # link_external — адрес:порт для share-ссылки с учётом прокси.
 # WS/gRPC/xHTTP/httpupgrade за nginx: внешний домен панели на 443.
 # REALITY/TLS+TCP: после перехода на stream-мастер (STREAM_443_MASTER=1) —
-# домен панели на 443, иначе собственный внешний порт канала.
+# домен панели на 443, иначе собственный внешний порт инбаунда.
 link_external() {
     case "$TRANSPORT" in
         ws|grpc|xhttp|httpupgrade)
@@ -1397,6 +1407,12 @@ gen_link_ss() {
         userinfo="$(b64url "$method:$CLIENT_PSK")"
     fi
     local q=()
+    # Инбаунды за прокси (nginx-мастер 443) терминируют TLS на nginx — клиенту
+    # нужен security=tls (иначе не-TLS ws-запрос не пройдёт через passthrough).
+    if [[ "$USE_NGINX" == "1" ]]; then
+        q+=("security=tls")
+        [[ -n "${PANEL_HOST:-}" ]] && q+=("sni=${PANEL_HOST}")
+    fi
     case "$TRANSPORT" in
         ws) q+=("type=ws" "path=${WS_PATH}" "host=${WS_HOST:-}") ;;
     esac
@@ -1487,8 +1503,8 @@ join_q() {
 
 menu_protocol() {
     banner ""
-    banner "  Выбор протокола Xray-канала (панель 3x-ui v3.6+)"
-    banner "  Все каналы поддерживаются панелью; ссылки генерируются для"
+    banner "  Выбор протокола Xray-инбаунда (панель 3x-ui v3.6+)"
+    banner "  Все инбаунды поддерживаются панелью; ссылки генерируются для"
     banner "  vless/vmess/trojan/ss/hy2/wireguard/mtproto (http/mixed — без ссылок)."
     banner ""
     cat <<'MENU'
@@ -1689,7 +1705,7 @@ BLOCK
 
 # nginx_ensure_snippet_included — подключает сниппет WS/gRPC regex-location'ов
 # в server-блок NGINX_CONF, если его там ещё нет. Иначе location'ы лежат
-# мёртвым грузом и WS-каналы за nginx возвращают 404.
+# мёртвым грузом и WS-инбаунды за nginx возвращают 404.
 nginx_ensure_snippet_included() {
     [[ -f "$NGINX_SNIPPET" ]] || return 0
     [[ -f "$NGINX_CONF" ]] || return 0
@@ -1762,7 +1778,7 @@ nginx_reality_target_server() {
     ok "REALITY target-заглушка: https://127.0.0.1:${port} (${sni})."
 }
 
-# nginx_stream_listen — адрес listen для stream-правила канала. nginx слушает
+# nginx_stream_listen — адрес listen для stream-правила инбаунда. nginx слушает
 # на ВНЕШНЕМ IP (не 0.0.0.0), иначе он занимает порт целиком и xray не может
 # забиндиться на 127.0.0.1:PORT. Если IP не удалось определить — fallback на
 # «порт без адреса» (0.0.0.0) с предупреждением.
@@ -1790,7 +1806,7 @@ nginx_add_stream_sni() {
     stream_listen="$(nginx_stream_listen)"
     sni_block=$(cat <<BLOCK
 
-# inbound-xray.sh: канал ${REMARK} (${PROTOCOL}, порт ${PORT})
+# inbound-xray.sh: инбаунд ${REMARK} (${PROTOCOL}, порт ${PORT})
 map \$ssl_preread_server_name \$up_${PORT} {
     default  127.0.0.1:${PORT};
 }
@@ -1821,7 +1837,7 @@ BLOCK
     ok "Добавлено stream-SNI правило в $NGINX_STREAM"
 }
 
-# nginx_add_stream_tcp — TCP-passthrough для TLS-канала (VMess/VLESS/Trojan+TCP+TLS).
+# nginx_add_stream_tcp — TCP-passthrough для TLS-инбаунда (VMess/VLESS/Trojan+TCP+TLS).
 nginx_add_stream_tcp() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
@@ -1838,7 +1854,7 @@ nginx_add_stream_tcp() {
     stream_listen="$(nginx_stream_listen)"
     block=$(cat <<BLOCK
 
-# inbound-xray.sh: канал ${REMARK} (${PROTOCOL}+${TRANSPORT}+${SECURITY}, порт ${PORT})
+# inbound-xray.sh: инбаунд ${REMARK} (${PROTOCOL}+${TRANSPORT}+${SECURITY}, порт ${PORT})
 server {
     listen ${stream_listen};
     proxy_pass 127.0.0.1:${PORT};
@@ -1875,7 +1891,7 @@ is_stream_443_master() {
 # nginx_stream_master_rebuild — пересобирает NGINX_STREAM в режиме мастера:
 # один server listen 443 с ssl_preread и map SNI → 127.0.0.1:<порт>.
 # default → внутренний http-модуль nginx (панель + WS/gRPC).
-# Каналы TLS/REALITY за nginx без SNI — отдельные passthrough-блоки.
+# Инбаунды TLS/REALITY за nginx без SNI — отдельные passthrough-блоки.
 nginx_stream_master_rebuild() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     local map_lines="" pass_lines="" row="" id="" port="" listen="" ss="" sni=""
@@ -1901,7 +1917,7 @@ nginx_stream_master_rebuild() {
                 map_lines="${map_lines}    ${sni}  127.0.0.1:${port};
 "
             else
-                warn "Дубль SNI $sni в БД — в map учтён только один канал (id=$id)."
+                warn "Дубль SNI $sni в БД — в map учтён только один инбаунд (id=$id)."
             fi
         else
             pass_lines="${pass_lines}
@@ -1979,7 +1995,7 @@ nginx_stream_master_setup() {
     if port_in_use "${STREAM_MASTER_PORT:-443}" tcp && ! is_stream_443_master; then
         warn "Порт ${STREAM_MASTER_PORT:-443} занят другим процессом."
         if [[ -n "$soft" ]]; then
-            warn "Продолжаем без stream-мастера (каналы будут на своих портах)."
+            warn "Продолжаем без stream-мастера (инбаунды будут на своих портах)."
             return 1
         fi
         confirm "Продолжить (порт будет перехвачен nginx)?" || return 1
@@ -2035,8 +2051,8 @@ nginx_stream_master_setup() {
 }
 
 # nginx_stream_rebuild_legacy — пересобирает NGINX_STREAM в классическом режиме
-# (без мастера): отдельный server listen <порт> на каждый TLS/REALITY канал
-# за nginx. Используется при удалении каналов, чтобы не оставлять «хвосты».
+# (без мастера): отдельный server listen <порт> на каждый TLS/REALITY инбаунд
+# за nginx. Используется при удалении инбаундов, чтобы не оставлять «хвосты».
 nginx_stream_rebuild_legacy() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     local blocks="" row="" port="" listen="" ss="" tmp bak
@@ -2085,33 +2101,79 @@ EOF
     fi
 }
 
-# delete_channel — меню удаления канала из панели (БД + nginx + firewall).
+# channel_name_label <протокол> <транспорт> <security> <внешний_порт> —
+# краткая метка инбаунда: VLESS-REALITY-443, VLESS-TCP-TLS-443, TROJAN-WS-443,
+# VLESS-KCP-10004 и т.п. Внешний порт 443 означает, что инбаунд за прокси.
+channel_name_label() {
+    local p="$1" t="$2" s="$3" port="$4" marker=""
+    case "$t" in
+        tcp)
+            case "$s" in
+                reality) marker="REALITY" ;;
+                tls)     marker="TCP-TLS" ;;
+                *)       marker="TCP" ;;
+            esac ;;
+        ws) marker="WS" ;;
+        grpc) marker="GRPC" ;;
+        xhttp) marker="XHTTP" ;;
+        httpupgrade) marker="HTTPUPGRADE" ;;
+        kcp) marker="KCP" ;;
+        hysteria) marker="HYSTERIA" ;;
+        quic) marker="QUIC" ;;
+        *) marker="${t^^}" ;;
+    esac
+    printf '%s-%s-%s\n' "${p^^}" "$marker" "$port"
+}
+
+# channel_default_ext_port <транспорт> <security> — внешний порт для имени по
+# умолчанию: 443 если инбаунд будет за прокси, иначе фактический PORT.
+channel_default_ext_port() {
+    local t="$1" s="$2"
+    case "$t" in
+        ws|grpc|xhttp|httpupgrade)
+            command -v nginx >/dev/null 2>&1 && printf '443' || printf '%s' "$PORT" ;;
+        tcp)
+            if [[ "$STREAM_443_MASTER" == "1" && ( "$s" == "tls" || "$s" == "reality" ) ]]; then
+                printf '443'
+            else
+                printf '%s' "$PORT"
+            fi ;;
+        *) printf '%s' "$PORT" ;;
+    esac
+}
+
+# delete_channel — меню удаления инбаунда из панели (БД + nginx + firewall).
 delete_channel() {
     local rows=""
-    rows="$(sqlite3 "$XUI_DB" "SELECT id, remark, port, protocol FROM inbounds ORDER BY id;" 2>/dev/null || true)"
+    rows="$(sqlite3 "$XUI_DB" "SELECT id, remark, port, protocol, replace(COALESCE(stream_settings,''),char(10),char(32)), COALESCE(listen,'') FROM inbounds ORDER BY id;" 2>/dev/null || true)"
     if [[ -z "$rows" ]]; then
-        info "Каналов в панели нет."
+        info "Инбаундов в панели нет."
         return 0
     fi
-    banner "  ========== Каналы панели =========="
-    local list=() i=1 id="" remark="" port="" proto="" rest="" sel="" del_id="" del_remark="" del_port="" del_proto=""
+    banner "  ========== Инбаунды панели =========="
+    local list=() i=1 id="" remark="" port="" proto="" stream="" listen="" tran="" sec="" extp="" rest="" sel="" del_id="" del_remark="" del_port="" del_proto=""
     while IFS= read -r line; do
         id="${line%%|*}"; rest="${line#*|}"
         remark="${rest%%|*}"; rest="${rest#*|}"
-        port="${rest%%|*}"; proto="${rest#*|}"
+        port="${rest%%|*}"; rest="${rest#*|}"
+        proto="${rest%%|*}"; rest="${rest#*|}"
+        stream="${rest%%|*}"; listen="${rest#*|}"
+        tran="$(json_extract "$stream" network)"
+        sec="$(json_extract "$stream" security)"
+        if [[ "$listen" == "127.0.0.1" ]]; then extp="443"; else extp="$port"; fi
         list+=("$id|$remark|$port|$proto")
-        echo "  $i) id=$id  ${proto}:${port}  $remark"
+        echo "  $i) id=$id  $(channel_name_label "$proto" "$tran" "$sec" "$extp")  $remark"
         i=$((i + 1))
     done <<< "$rows"
-    read -r -p "Номер канала для удаления (0 — отмена): " sel || return 0
+    read -r -p "Номер инбаунда для удаления (0 — отмена): " sel || return 0
     [[ "$sel" =~ ^[0-9]+$ ]] || return 0
     (( sel >= 1 && sel <= ${#list[@]} )) || { warn "Неверный номер."; return 0; }
     IFS='|' read -r del_id del_remark del_port del_proto <<< "${list[$((sel - 1))]}"
-    if ! confirm "Удалить канал #$del_id «$del_remark» (${del_proto}:${del_port})?"; then
+    if ! confirm "Удалить инбаунд #$del_id «$del_remark» (${del_proto}:${del_port})?"; then
         info "Отменено."
         return 0
     fi
-    # Определяем, выходил ли канал через 443 (правило в firewall не создавалось)
+    # Определяем, выходил ли инбаунд через 443 (правило в firewall не создавалось)
     # и по какому фактическому протоколу (tcp/udp) он работал — до удаления.
     local del_ss="" del_listen="" del_cproto="tcp" del_remove=0
     del_ss="$(sqlite3 "$XUI_DB" "SELECT replace(COALESCE(stream_settings,''),char(10),char(32)) FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
@@ -2120,7 +2182,7 @@ delete_channel() {
         hysteria*|wireguard) del_cproto="udp" ;;
     esac
     printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"kcp"' && del_cproto="udp"
-    # Через 443 идут каналы за nginx с http-транспортом (ws/grpc/xhttp/
+    # Через 443 идут инбаунды за nginx с http-транспортом (ws/grpc/xhttp/
     # httpupgrade) — для них правило не создавалось, удалять нечего.
     if [[ "$del_listen" != "127.0.0.1" ]]; then
         del_remove=1
@@ -2135,12 +2197,12 @@ delete_channel() {
         nginx_stream_rebuild_legacy
     fi
     # Удаляем только существующее allow-правило (не добавляем deny),
-    # и только для каналов, выходивших не через 443.
+    # и только для инбаундов, выходивших не через 443.
     if [[ "$del_remove" == "1" ]]; then
         firewall_port_remove "$del_port" "$del_cproto" 2>/dev/null || true
     fi
     restart_xui
-    ok "Канал «$del_remark» удалён."
+    ok "Инбаунд «$del_remark» удалён."
 }
 
 # =============================================================================
@@ -2149,7 +2211,8 @@ delete_channel() {
 
 print_summary() {
     banner ""
-    banner "  ========== Итоги: канал «${REMARK}» =========="
+    banner "  ========== Итоги: инбаунд «${REMARK}» =========="
+    banner "  Метка: $(channel_name_label "$PROTOCOL" "$TRANSPORT" "$SECURITY" "$(channel_default_ext_port "$TRANSPORT" "$SECURITY")")"
     banner "  Протокол: ${PROTOCOL}  Транспорт: ${TRANSPORT}  Безопасность: ${SECURITY}"
     banner "  Порт: ${PORT}   Слушает: ${LISTEN:-0.0.0.0}"
     [[ -n "$INBOUND_ID" ]] && banner "  ID inbound в панели: ${INBOUND_ID}"
@@ -2195,7 +2258,7 @@ print_summary() {
         printf 'Sub URL: %s\n' "$(sub_url "$CLIENT_SUBID")" >> "$LOG_FILE"
     fi
     banner ""
-    info "Канал создан. Панель: x-ui → «Список inbound» (id ${INBOUND_ID:-?})."
+    info "Инбаунд создан. Панель: x-ui → «Список inbound» (id ${INBOUND_ID:-?})."
 }
 
 # =============================================================================
@@ -2488,7 +2551,7 @@ db_set_setting() {
     fi
 }
 
-# db_add_host_record <inbound_id> — запись в таблицу hosts для каналов за прокси.
+# db_add_host_record <inbound_id> — запись в таблицу hosts для инбаундов за прокси.
 # Внешний адрес/порт/sni/path подставляются в ссылки подписки автоматически.
 db_add_host_record() {
     local inbound_id="$1"
@@ -2522,7 +2585,7 @@ db_add_host_record() {
         ($inbound_id, 0, '$(sql_escape "$REMARK")', 0, '$(sql_escape "$addr")', $hport,
          '$(sql_escape "$sec")', '$(sql_escape "$sni")', '$(sql_escape "$path")',
          $(date +%s000), $(date +%s000));" \
-        || warn "Не удалось добавить запись hosts для канала (подписка может давать неверные адреса)."
+        || warn "Не удалось добавить запись hosts для инбаунда (подписка может давать неверные адреса)."
 }
 
 # sub_url <subId> — URL подписки: через nginx или напрямую на суб-порт.
@@ -2577,12 +2640,12 @@ setup_subscription() {
     printf '%s\n' "  Sub Domain:  $ext"
     banner ""
     if [[ -n "$CLIENT_SUBID" ]]; then
-        ok "Ссылка текущего канала: $(sub_url "$CLIENT_SUBID")"
+        ok "Ссылка текущего инбаунда: $(sub_url "$CLIENT_SUBID")"
     fi
 }
 
 # =============================================================================
-# Создание одного канала (от выбора протокола до сводки)
+# Создание одного инбаунда (от выбора протокола до сводки)
 # =============================================================================
 
 create_channel() {
@@ -2598,10 +2661,18 @@ create_channel() {
 
     menu_protocol
 
-    # Метод Shadowsocks по умолчанию
+    # Метод Shadowsocks по умолчанию. Внимание: на ядре 26.7.28 (текущая
+    # сборка на серверах) SS-2022 (2022-blake3-*) принимает конфиг, но
+    # клиентские подключения не проходят аутентификацию — метод не рабочий.
+    # По умолчанию используем рабочий aes-256-gcm; 2022 оставляем на выбор.
     [[ "$PROTOCOL" == "shadowsocks" ]] && {
-        ask "Метод Shadowsocks" "2022-blake3-aes-256-gcm" SS_METHOD
-        # Проверка корректности метода
+        ask "Метод Shadowsocks" "aes-256-gcm" SS_METHOD
+        case "$SS_METHOD" in
+            2022-*)
+                warn "SS-2022 (2022-blake3-*) может не работать на текущем ядре Xray"
+                warn "(клиенты не проходят аутентификацию). Рекомендуем aes-256-gcm."
+                ;;
+        esac
         case "$SS_METHOD" in
             aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;;
             *) warn "Метод «$SS_METHOD» может не поддерживаться Xray; оставляем." ;;
@@ -2618,11 +2689,11 @@ create_channel() {
 
     # Remark и клиент
     local def_remark def_email def_subid
-    def_remark="${PROTOCOL^^}-${TRANSPORT^^}-${PORT}"
+    def_remark="$(channel_name_label "$PROTOCOL" "$TRANSPORT" "$SECURITY" "$(channel_default_ext_port "$TRANSPORT" "$SECURITY")")"
     while true; do
-        ask "Наименование канала (remark)" "$def_remark" REMARK
+        ask "Наименование инбаунда (remark)" "$def_remark" REMARK
         if db_remark_in_use "$REMARK"; then
-            warn "Канал с наименованием «$REMARK» уже существует."
+            warn "Инбаунд с наименованием «$REMARK» уже существует."
             confirm "Продолжить с тем же именем?" || continue
         fi
         break
@@ -2640,7 +2711,7 @@ create_channel() {
             if [[ -n "$cid" ]]; then
                 plist="$(sqlite3 "$XUI_DB" "SELECT DISTINCT i.protocol FROM client_inbounds ci JOIN inbounds i ON i.id = ci.inbound_id WHERE ci.client_id = $cid;" 2>/dev/null || true)"
                 if [[ -n "$plist" && "$plist" != "$PROTOCOL" ]]; then
-                    warn "Клиент «$CLIENT_EMAIL» уже есть, но его каналы — $plist (нужен $PROTOCOL)."
+                    warn "Клиент «$CLIENT_EMAIL» уже есть, но его инбаунды — $plist (нужен $PROTOCOL)."
                     warn "Переиспользование возможно только при совпадении протокола."
                     continue
                 fi
@@ -2671,7 +2742,7 @@ create_channel() {
             while true; do
                 ask "Путь (для nginx нужен формат /<порт>/<name>)" "/${PORT}/$(gen_hex 5)" WS_PATH
                 if db_path_in_use "$WS_PATH"; then
-                    warn "Путь $WS_PATH уже используется другим каналом за прокси."
+                    warn "Путь $WS_PATH уже используется другим инбаундом за прокси."
                     confirm "Продолжить с тем же путём?" || continue
                 fi
                 break
@@ -2680,32 +2751,32 @@ create_channel() {
     esac
     if [[ "$SECURITY" == "tls" ]]; then
         if [[ "$TRANSPORT" == "tcp" ]]; then
-            # TCP+TLS: уникальный домен канала + собственный сертификат
+            # TCP+TLS: уникальный домен инбаунда + собственный сертификат
             local prefix="" def_sni=""
             case "$PROTOCOL" in vless) prefix="v";; vmess) prefix="m";; trojan) prefix="t";; *) prefix="x";; esac
             if [[ -n "$PANEL_HOST" ]]; then
                 def_sni="${prefix}.${PANEL_HOST}"
-                warn "Для TCP+TLS канала нужен уникальный домен (SNI)."
+                warn "Для TCP+TLS инбаунда нужен уникальный домен (SNI)."
                 warn "Добавь у регистратора запись A: $def_sni → $SERVER_IP (или CNAME на $PANEL_HOST)."
             else
-                warn "У панели нет домена (сертификат по IP). Укажи домен канала вручную."
+                warn "У панели нет домена (сертификат по IP). Укажи домен инбаунда вручную."
             fi
             while true; do
-                ask "Домен канала (SNI, TCP+TLS)" "$def_sni" CHANNEL_SNI
+                ask "Домен инбаунда (SNI, TCP+TLS)" "$def_sni" CHANNEL_SNI
                 [[ -n "$CHANNEL_SNI" ]] || die "Для TCP+TLS домен обязателен."
                 if [[ -n "$PANEL_HOST" && "$CHANNEL_SNI" == "$PANEL_HOST" ]]; then
-                    warn "SNI совпадает с доменом панели — канал будет недоступен (SSL конфликт)."
+                    warn "SNI совпадает с доменом панели — инбаунд будет недоступен (SSL конфликт)."
                     continue
                 fi
                 if db_sni_in_use "$CHANNEL_SNI" tls; then
-                    warn "SNI $CHANNEL_SNI уже используется другим каналом."
+                    warn "SNI $CHANNEL_SNI уже используется другим инбаундом."
                     continue
                 fi
                 break
             done
             SNI="$CHANNEL_SNI"
             ensure_channel_cert "$CHANNEL_SNI"
-            info "SNI канала: $SNI (сертификат: ${CHANNEL_CERT_DIR:-сертификат панели})."
+            info "SNI инбаунда: $SNI (сертификат: ${CHANNEL_CERT_DIR:-сертификат панели})."
         else
             SNI="${PANEL_HOST:-$(external_addr)}"
             info "SNI для TLS: $SNI"
@@ -2723,8 +2794,8 @@ create_channel() {
                 continue
             fi
             if db_sni_in_use "$CHANNEL_SNI" reality; then
-                warn "SNI $CHANNEL_SNI уже используется другим REALITY-каналом."
-                warn "При одинаковом SNI stream-443 не сможет различить каналы."
+                warn "SNI $CHANNEL_SNI уже используется другим REALITY-инбаундом."
+                warn "При одинаковом SNI stream-443 не сможет различить инбаунды."
                 continue
             fi
             break
@@ -2738,7 +2809,7 @@ create_channel() {
         info "REALITY: поддомен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
     fi
 
-    # nginx-интеграция: все проксируемые каналы ВСЕГДА за 443 (stream-мастер),
+    # nginx-интеграция: все проксируемые инбаунды ВСЕГДА за 443 (stream-мастер),
     # без вопросов. Если nginx не установлен — устанавливаем автоматически.
     USE_NGINX=""
     local can_proxy=""
@@ -2750,8 +2821,8 @@ create_channel() {
     esac
     if [[ -n "$can_proxy" ]]; then
         if ! command -v nginx >/dev/null 2>&1; then
-            info "nginx не установлен — устанавливаем для прокси канала за 443..."
-            install_pkg "$(nginx_pkg)" || warn "Не удалось установить nginx — канал будет создан напрямую."
+            info "nginx не установлен — устанавливаем для прокси инбаунда за 443..."
+            install_pkg "$(nginx_pkg)" || warn "Не удалось установить nginx — инбаунд будет создан напрямую."
             command -v nginx >/dev/null 2>&1 && systemctl enable nginx >/dev/null 2>&1 || true
         fi
         if command -v nginx >/dev/null 2>&1; then
@@ -2762,7 +2833,7 @@ create_channel() {
             if ! is_stream_443_master; then
                 nginx_stream_master_setup auto
             fi
-            info "Канал будет слушать 127.0.0.1:${PORT} (за nginx на 443)."
+            info "Инбаунд будет слушать 127.0.0.1:${PORT} (за nginx на 443)."
         fi
     fi
 
@@ -2782,9 +2853,9 @@ create_channel() {
     local settings_json stream_json snf_json
     settings_json="$(build_settings "$PROTOCOL" "$CLIENT_JSON" "$SS_METHOD")"
     if [[ -n "$USE_NGINX" && "$TRANSPORT" != "tcp" ]]; then
-        # Канал за nginx (ws/grpc/xhttp/httpupgrade): TLS терминируется на
+        # Инбаунд за nginx (ws/grpc/xhttp/httpupgrade): TLS терминируется на
         # nginx, поэтому xray слушает на 127.0.0.1:PORT БЕЗ TLS.
-        info "Канал за nginx: TLS терминируется на nginx, xray слушает без TLS."
+        info "Инбаунд за nginx: TLS терминируется на nginx, xray слушает без TLS."
         stream_json="$(build_stream "$TRANSPORT" "none" "$WS_PATH" "$WS_HOST" "$SNI")"
     else
         stream_json="$(build_stream "$TRANSPORT" "$SECURITY" "$WS_PATH" "$WS_HOST" "$SNI")"
@@ -2796,9 +2867,9 @@ create_channel() {
         snf_json="$(sniffing_json 1)"
     fi
 
-    info "Вставка канала в базу панели..."
+    info "Вставка инбаунда в базу панели..."
     db_insert_inbound "$settings_json" "$stream_json" "$snf_json"
-    ok "Канал добавлен (inbound id=${INBOUND_ID})."
+    ok "Инбаунд добавлен (inbound id=${INBOUND_ID})."
     db_add_client_records "$INBOUND_ID"
     ok "Клиент «$CLIENT_EMAIL» добавлен."
 
@@ -2819,15 +2890,15 @@ create_channel() {
             nginx_add_stream_tcp
         fi
         # Внешний адрес/порт для подписки (запись в таблицу hosts) — всегда
-        # при канале за прокси, независимо от включённой подписки.
+        # при инбаунде за прокси, независимо от включённой подписки.
         db_add_host_record "$INBOUND_ID"
     fi
 
-    # Порт канала в firewall — только если канал выходит НЕ через 443.
-    # Без прокси — прямой порт канала. В legacy-режиме (мастер не удалось
-    # включить) tcp/reality/tls-каналы слушают свой passthrough-порт — тоже
+    # Порт инбаунда в firewall — только если инбаунд выходит НЕ через 443.
+    # Без прокси — прямой порт инбаунда. В legacy-режиме (мастер не удалось
+    # включить) tcp/reality/tls-инбаунды слушают свой passthrough-порт — тоже
     # открываем. В stream-мастере снаружи открыт только 443 (открывается при
-    # включении мастера), порт канала не трогаем.
+    # включении мастера), порт инбаунда не трогаем.
     if [[ -z "$USE_NGINX" ]]; then
         firewall_port_open "$PORT" "$CHANNEL_PROTO"
     elif [[ "$STREAM_443_MASTER" != "1" && "$TRANSPORT" == "tcp" && ( "$SECURITY" == "reality" || "$SECURITY" == "tls" ) ]]; then
@@ -2845,7 +2916,7 @@ create_channel() {
 
 main() {
     setup_log
-    banner "inbound-xray.sh v${SCRIPT_VERSION} — настройка Xray-каналов для 3x-ui"
+    banner "inbound-xray.sh v${SCRIPT_VERSION} — настройка Xray-инбаундов для 3x-ui"
     banner "Поддержка панели 3x-ui v3.6+ (формат базы данных)."
     banner ""
     require_root
@@ -2856,7 +2927,7 @@ main() {
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
         # «Всё через 443» включается автоматически: stream-мастер на 443,
-        # все каналы и панель выходят наружу через единый 443.
+        # все инбаунды и панель выходят наружу через единый 443.
         if ! is_stream_443_master; then
             nginx_stream_master_setup auto
         fi
@@ -2871,10 +2942,10 @@ main() {
     while true; do
         banner ""
         banner "  ========== Главное меню =========="
-        echo "   1) Создать Xray-канал"
+        echo "   1) Создать Xray-инбаунд"
         echo "   2) Включить заглушку (панель скрыть на пути, корень → сайт)"
         echo "   3) Отключить заглушку (панель на корень)"
-        echo "   4) Удалить канал"
+        echo "   4) Удалить инбаунд"
         echo "   0) Выход"
         echo "===================================="
         local ans=""
