@@ -1239,19 +1239,23 @@ db_add_client_records() {
 }
 
 # restart_xui — перезапуск панели (применяет конфигурацию xray).
+# Сбрасывает счётчик systemd start-limit: при частых операциях (несколько
+# удалений/созданий подряд) systemd блокирует рестарт («start request repeated
+# too quickly»); при неудачном restart — повторный запуск через start.
 restart_xui() {
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files x-ui.service >/dev/null 2>&1; then
         info "Перезапуск панели x-ui (применение конфигурации)..."
-        if systemctl restart x-ui; then
-            sleep 2
-            if systemctl is-active x-ui >/dev/null 2>&1; then
-                ok "Панель x-ui перезапущена и активна."
-            else
-                fail "Панель x-ui не запустилась — проверьте конфигурацию (journalctl -u x-ui)."
-                return 1
-            fi
+        systemctl reset-failed x-ui.service 2>/dev/null || true
+        if ! systemctl restart x-ui; then
+            # Возможен start-limit-hit — сбросить счётчик и запустить напрямую.
+            systemctl reset-failed x-ui.service 2>/dev/null || true
+            systemctl start x-ui
+        fi
+        sleep 2
+        if systemctl is-active x-ui >/dev/null 2>&1; then
+            ok "Панель x-ui перезапущена и активна."
         else
-            fail "Не удалось перезапустить x-ui."
+            fail "Панель x-ui не запустилась — проверьте конфигурацию (journalctl -u x-ui)."
             return 1
         fi
     else
@@ -2178,44 +2182,97 @@ delete_channel() {
         echo "  $i) id=$id  $(channel_name_label "$proto" "$tran" "$sec" "$extp")  $remark"
         i=$((i + 1))
     done <<< "$rows"
-    read -r -p "Номер инбаунда для удаления (0 — отмена): " sel || return 0
-    [[ "$sel" =~ ^[0-9]+$ ]] || return 0
-    (( sel >= 1 && sel <= ${#list[@]} )) || { warn "Неверный номер."; return 0; }
-    IFS='|' read -r del_id del_remark del_port del_proto <<< "${list[$((sel - 1))]}"
-    if ! confirm "Удалить инбаунд #$del_id «$del_remark» (${del_proto}:${del_port})?"; then
+    # Ввод одного или нескольких номеров через запятую и/или диапазоны
+    # (2 или 2,5,7 или 2-5). Пустой ввод или 0 — отмена.
+    read -r -p "Номер(а) инбаунда(ов) через запятую/диапазон, напр. 2 или 2,5,7 или 2-5 (0 — отмена): " sel || return 0
+    sel="$(printf '%s' "$sel" | tr -d ' ')"
+    [[ -n "$sel" && "$sel" != "0" ]] || return 0
+    # Разбор токенов (число или N-M) в уникальные номера списка
+    local picks=() tokens=() tok="" m="" n="" nn="" dup="" k="" r=""
+    IFS=',' read -ra tokens <<< "$sel"
+    for tok in "${tokens[@]}"; do
+        if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            m="${BASH_REMATCH[1]}"; n="${BASH_REMATCH[2]}"
+            if (( m > n )); then
+                warn "Неверный диапазон «$tok»."
+                return 0
+            fi
+            for (( nn = m; nn <= n; nn++ )); do
+                if (( nn < 1 || nn > ${#list[@]} )); then
+                    warn "Номер $nn вне списка (1-${#list[@]})."
+                    return 0
+                fi
+                dup=0
+                for k in "${picks[@]}"; do [[ "$k" == "$nn" ]] && dup=1; done
+                (( dup )) || picks+=("$nn")
+            done
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+            if (( tok < 1 || tok > ${#list[@]} )); then
+                warn "Номер $tok вне списка (1-${#list[@]})."
+                return 0
+            fi
+            dup=0
+            for k in "${picks[@]}"; do [[ "$k" == "$tok" ]] && dup=1; done
+            (( dup )) || picks+=("$tok")
+        else
+            warn "Некорректный ввод «$tok» — ожидаются номера/диапазоны через запятую."
+            return 0
+        fi
+    done
+    (( ${#picks[@]} > 0 )) || return 0
+    # Список удаляемых (id|remark|port|proto) + текст подтверждения
+    local del_records=() desc="" id="" remark="" port="" proto=""
+    for nn in "${picks[@]}"; do
+        r="${list[$((nn - 1))]}"
+        del_records+=("$r")
+        IFS='|' read -r id remark port proto <<< "$r"
+        if [[ -n "$desc" ]]; then desc="$desc, "; fi
+        desc="$desc#$id «$remark» (${proto}:${port})"
+    done
+    if ! confirm "Удалить инбаунды: $desc?"; then
         info "Отменено."
         return 0
     fi
-    # Определяем, выходил ли инбаунд через 443 (правило в firewall не создавалось)
-    # и по какому фактическому протоколу (tcp/udp) он работал — до удаления.
-    local del_ss="" del_listen="" del_cproto="tcp" del_remove=0
-    del_ss="$(sqlite3 "$XUI_DB" "SELECT replace(COALESCE(stream_settings,''),char(10),char(32)) FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
-    del_listen="$(sqlite3 "$XUI_DB" "SELECT COALESCE(listen,'') FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
-    case "$del_proto" in
-        hysteria*|wireguard) del_cproto="udp" ;;
-    esac
-    printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"kcp"' && del_cproto="udp"
-    # Через 443 идут инбаунды за nginx с http-транспортом (ws/grpc/xhttp/
-    # httpupgrade) — для них правило не создавалось, удалять нечего.
-    if [[ "$del_listen" != "127.0.0.1" ]]; then
-        del_remove=1
-    elif printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"tcp"'; then
-        # tcp+reality/tls за nginx в legacy слушал свой passthrough-порт
-        del_remove=1
-    fi
-    db_delete_inbound "$del_id"
+    # Удаление всех выбранных + сбор правил firewall (только существующие,
+    # только по фактическому протоколу tcp/udp, без дублей).
+    local fw_rules=() del_id="" del_remark="" del_port="" del_proto=""
+    local del_ss="" del_listen="" del_cproto="tcp" del_remove=0 fw="" fdup=0 f2=""
+    for r in "${del_records[@]}"; do
+        IFS='|' read -r del_id del_remark del_port del_proto <<< "$r"
+        del_cproto="tcp"; del_remove=0
+        del_ss="$(sqlite3 "$XUI_DB" "SELECT replace(COALESCE(stream_settings,''),char(10),char(32)) FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
+        del_listen="$(sqlite3 "$XUI_DB" "SELECT COALESCE(listen,'') FROM inbounds WHERE id=$del_id;" 2>/dev/null || true)"
+        case "$del_proto" in
+            hysteria*|wireguard) del_cproto="udp" ;;
+        esac
+        printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"kcp"' && del_cproto="udp"
+        # Через 443 идут инбаунды за nginx с http-транспортом (ws/grpc/xhttp/
+        # httpupgrade) — для них правило не создавалось, удалять нечего.
+        if [[ "$del_listen" != "127.0.0.1" ]]; then
+            del_remove=1
+        elif printf '%s' "$del_ss" | grep -Eq '"network"[[:space:]]*:[[:space:]]*"tcp"'; then
+            # tcp+reality/tls за nginx в legacy слушал свой passthrough-порт
+            del_remove=1
+        fi
+        db_delete_inbound "$del_id"
+        if [[ "$del_remove" == "1" ]]; then
+            fw="$del_port|$del_cproto"
+            fdup=0
+            for f2 in "${fw_rules[@]}"; do [[ "$f2" == "$fw" ]] && fdup=1; done
+            (( fdup )) || fw_rules+=("$fw")
+        fi
+    done
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
         nginx_stream_master_rebuild
     else
         nginx_stream_rebuild_legacy
     fi
-    # Удаляем только существующее allow-правило (не добавляем deny),
-    # и только для инбаундов, выходивших не через 443.
-    if [[ "$del_remove" == "1" ]]; then
+    for fw in "${fw_rules[@]}"; do
+        IFS='|' read -r del_port del_cproto <<< "$fw"
         firewall_port_remove "$del_port" "$del_cproto" 2>/dev/null || true
-    fi
+    done
     restart_xui
-    ok "Инбаунд «$del_remark» удалён."
+    ok "Инбаунды удалены: $desc."
 }
 
 # =============================================================================
