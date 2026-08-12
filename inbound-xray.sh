@@ -2047,10 +2047,21 @@ is_stream_443_master() {
 # один server listen 443 с ssl_preread и map SNI → 127.0.0.1:<порт>.
 # default → внутренний http-модуль nginx (панель + WS/gRPC).
 # Инбаунды TLS/REALITY за nginx без SNI — отдельные passthrough-блоки.
+# stream_sni_in_map <map_lines> <sni> — занят ли ключ SNI в уже собранных
+# строках map stream-мастера (любым бэкендом). Печатает порт занявшего
+# инбаунда; пусто — SNI свободен. Предотвращает дубликаты ключей в map,
+# которые валят nginx -t (conflicting parameter).
+stream_sni_in_map() {
+    local ml="$1" sni="$2" esc
+    esc="$(printf '%s' "$sni" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+    [[ -n "$esc" ]] || return 0
+    printf '%s' "$ml" | sed -n "s#^    ${esc}[[:space:]]\+127\.0\.0\.1:\([0-9]\+\);#\1#p" | head -1
+}
+
 nginx_stream_master_rebuild() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     local map_lines="" pass_lines="" row="" id="" port="" listen="" ss="" sni=""
-    local rows="" sni_esc=""
+    local rows=""
     rows="$(sqlite3 "$XUI_DB" "SELECT id, port, listen, replace(stream_settings, char(10), char(32)) FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
     while IFS= read -r row; do
         [[ -z "$row" ]] && continue
@@ -2067,8 +2078,7 @@ nginx_stream_master_rebuild() {
             sni="$(printf '%s' "$ss" | sed -n 's/.*"serverName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
         fi
         if [[ -n "$sni" ]]; then
-            sni_esc="$(printf '%s' "$sni" | sed 's/[.[\*^$(){}?+|]/\\./g')"
-            if ! printf '%s' "$map_lines" | grep -Eq "^    ${sni_esc}[[:space:]]+127\.0\.0\.1:${port};$"; then
+            if [[ -z "$(stream_sni_in_map "$map_lines" "$sni")" ]]; then
                 map_lines="${map_lines}    ${sni}  127.0.0.1:${port};
 "
             else
@@ -2099,25 +2109,32 @@ server {
     # Домен панели → http-модуль nginx (панель + WS/gRPC). Без этой строки
     # пересборка мастера теряет панель: её SNI уходил бы в default (REALITY)
     # и браузер получал бы чужой сертификат (ERR_CERT_COMMON_NAME_INVALID).
+    # Строка не добавляется, если SNI панели уже занят каким-то инбаундом
+    # (иначе дубликат ключа в map валит nginx -t).
     local panel_line=""
+    local busy_port=""
     if [[ -n "$PANEL_HOST" && -n "$PANEL_SSL_PORT" ]]; then
-        local panel_sni_esc
-        panel_sni_esc="$(printf '%s' "$PANEL_HOST" | sed 's/[.[\*^$(){}?+|]/\\./g')"
-        if ! printf '%s' "$map_lines" | grep -Eq "^    ${panel_sni_esc}[[:space:]]+127\.0\.0\.1:${PANEL_SSL_PORT};$"; then
+        busy_port="$(stream_sni_in_map "$map_lines" "$PANEL_HOST")"
+        if [[ -n "$busy_port" ]]; then
+            warn "SNI панели ${PANEL_HOST} занят инбаундом (порт ${busy_port}) — панель по домену недоступна, строка в map не добавлена."
+        else
             panel_line="    ${PANEL_HOST}  127.0.0.1:${PANEL_SSL_PORT};
 "
         fi
     fi
     # Корневой домен (заглушка) → тоже на http-модуль nginx, чтобы не уходил
     # в default (REALITY) и получал свой сертификат в отдельном server-блоке.
+    # Если корневой SNI занят REALITY/TLS-инбаундом — строка не добавляется:
+    # заглушку корня уже отдаёт target-заглушка REALITY с валидным LE-сертом.
     local root_line=""
     local root_dom=""
     root_dom="$(domain_root "$PANEL_HOST")"
     if [[ -n "$root_dom" && "$root_dom" != "$PANEL_HOST" && -n "$PANEL_SSL_PORT" \
         && -f "/etc/letsencrypt/live/${root_dom}/fullchain.pem" ]]; then
-        local root_esc
-        root_esc="$(printf '%s' "$root_dom" | sed 's/[.[\*^$(){}?+|]/\\./g')"
-        if ! printf '%s' "$map_lines" | grep -Eq "^    ${root_esc}[[:space:]]+127\.0\.0\.1:${PANEL_SSL_PORT};$"; then
+        busy_port="$(stream_sni_in_map "$map_lines" "$root_dom")"
+        if [[ -n "$busy_port" ]]; then
+            warn "SNI корневого домена ${root_dom} занят инбаундом (порт ${busy_port}) — заглушку корня отдаёт REALITY (target), строка в map не добавлена."
+        else
             root_line="    ${root_dom}  127.0.0.1:${PANEL_SSL_PORT};
 "
         fi
@@ -2719,11 +2736,20 @@ ${up_extra}
     # Второй server-блок для корневого домена (заглушка со своим сертификатом):
     # при панели на поддомене (p.plesav.ru) корень (plesav.ru) тоже должен
     # отвечать правильно, иначе браузер видит чужой сертификат (name error).
-    # Включается только в режиме stream-мастера, где оба домена слушает nginx.
+    # Включается только в режиме stream-мастера, где оба домена слушает nginx,
+    # и только если корневой SNI не занят REALITY/TLS-инбаундом (иначе трафик
+    # корня идёт на passthrough, а заглушку отдаёт target-заглушка REALITY).
     local extra_block=""
     local root_dom=""
     root_dom="$(domain_root "$PANEL_HOST")"
+    local root_taken=""
     if [[ "$STREAM_443_MASTER" == "1" && -n "$root_dom" && "$root_dom" != "$PANEL_HOST" \
+        && -f "/etc/letsencrypt/live/${root_dom}/fullchain.pem" ]]; then
+        root_taken="$(sqlite3 "$XUI_DB" "SELECT port FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND port != ${STREAM_MASTER_PORT:-443} AND listen = '127.0.0.1' AND stream_settings LIKE '%\"network\": \"tcp\"%' AND (stream_settings LIKE '%\"serverNames\": [\"$(sql_escape "$root_dom")\"]%' OR stream_settings LIKE '%\"serverName\": \"$(sql_escape "$root_dom")\"%') LIMIT 1;" 2>/dev/null || true)"
+        [[ -z "$root_taken" ]] || warn "SNI корневого домена ${root_dom} занят инбаундом (порт ${root_taken}) — отдельный server-блок заглушки не нужен (заглушку отдаёт REALITY)."
+    fi
+    if [[ -z "$root_taken" && "$STREAM_443_MASTER" == "1" && -n "$root_dom" \
+        && "$root_dom" != "$PANEL_HOST" \
         && -f "/etc/letsencrypt/live/${root_dom}/fullchain.pem" ]]; then
         extra_block="
 server {
