@@ -429,6 +429,16 @@ gen_uuid() {
 
 gen_hex() { openssl rand -hex "${1:-4}"; }
 
+# gen_panel_path — случайный скрытый путь панели: 18 символов из [a-z0-9]
+# (строчные буквы + цифры). Используется как webBasePath (вместо /panel/).
+gen_panel_path() {
+    local p=""
+    p="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 18)" \
+        && [[ -n "$p" ]] || p="$(openssl rand -hex 18 2>/dev/null | cut -c1-18)"
+    [[ -n "$p" ]] || p="panel"
+    printf '%s' "$p"
+}
+
 gen_password() {
     local len="${1:-16}"
     openssl rand -base64 48 2>/dev/null | tr -d '[:space:]' | tr '+/' '-_' | cut -c1-"$len"
@@ -1999,10 +2009,22 @@ server {
         real_def="$(sqlite3 "$XUI_DB" "SELECT port FROM inbounds WHERE protocol='vless' AND stream_settings LIKE '%realitySettings%' ORDER BY id LIMIT 1;" 2>/dev/null || true)"
     fi
     [[ -n "$real_def" ]] || real_def="$PANEL_SSL_PORT"
+    # Домен панели → http-модуль nginx (панель + WS/gRPC). Без этой строки
+    # пересборка мастера теряет панель: её SNI уходил бы в default (REALITY)
+    # и браузер получал бы чужой сертификат (ERR_CERT_COMMON_NAME_INVALID).
+    local panel_line=""
+    if [[ -n "$PANEL_HOST" && -n "$PANEL_SSL_PORT" ]]; then
+        local panel_sni_esc
+        panel_sni_esc="$(printf '%s' "$PANEL_HOST" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+        if ! printf '%s' "$map_lines" | grep -Eq "^    ${panel_sni_esc}[[:space:]]+127\.0\.0\.1:${PANEL_SSL_PORT};$"; then
+            panel_line="    ${PANEL_HOST}  127.0.0.1:${PANEL_SSL_PORT};
+"
+        fi
+    fi
     cat > "$tmp" <<EOF
 # inbound-xray.sh: stream-443 master (все внешние TLS-потоки идут на ${STREAM_MASTER_PORT:-443})
 map \$ssl_preread_server_name \$xui_backend {
-${map_lines}    default  127.0.0.1:${real_def};
+${map_lines}${panel_line}    default  127.0.0.1:${real_def};
 }
 
 server {
@@ -2621,7 +2643,7 @@ setup_landing() {
     info "Текущий путь панели (webBasePath): ${PANEL_PATH:-/}"
     if [[ -z "$PANEL_PATH" || "$PANEL_PATH" == "/" || "$PANEL_PATH" == "./" ]]; then
         local new_path=""
-        ask "Путь панели (Enter — случайный)" "$(gen_hex 10)" new_path
+        ask "Путь панели (Enter — случайный)" "$(gen_panel_path)" new_path
         set_panel_base_path "$new_path"
     else
         info "Панель уже на пути ${PANEL_PATH} — заглушка займёт корень."
