@@ -253,12 +253,18 @@ require_panel() {
 
 # --- Определение окружения панели -------------------------------------------------
 
-# detect_panel_cert — ищет сертификат панели: /root/cert/ip (IP) или /root/cert/<домен>.
+# detect_panel_cert — ищет сертификат панели. Источники по приоритету:
+#  1. /root/cert/ip            — IP-сертификат (панель по IP, PANEL_HOST пустой);
+#  2. /root/cert/<домен>       — доменные каталоги;
+#  3. /etc/letsencrypt/live/*  — сертификаты Let's Encrypt (certbot).
 # Устанавливает PANEL_CERT, PANEL_CERT_KEY, PANEL_CERT_DIR и PANEL_HOST (домен из SAN).
 detect_panel_cert() {
     PANEL_CERT=""; PANEL_CERT_KEY=""; PANEL_CERT_DIR=""; PANEL_HOST=""
     local base="/root/cert"
-    [[ -d "$base" ]] || return 0
+    local dirs=()
+    [[ -d "$base" ]] && dirs+=("$base")
+    [[ -d /etc/letsencrypt/live ]] && dirs+=(/etc/letsencrypt/live)
+    ((${#dirs[@]} == 0)) && return 0
 
     # Приоритет: каталог по IP, затем доменные каталоги
     local ip_cert="$base/ip"
@@ -269,13 +275,32 @@ detect_panel_cert() {
         return 0
     fi
 
+    # Приоритет: домен панели из nginx-конфига (server_name ssl-сервера панели).
+    # На него указывает A-запись, он уже терминирует TLS — это и есть панель.
+    local pconf="${NGINX_CONF:-/etc/nginx/conf.d/x-ui.conf}"
+    if [[ -f "$pconf" ]]; then
+        local sname=""
+        sname="$(sed -n 's/.*server_name[[:space:]]*\([^;]*\);.*/\1/p' "$pconf" | tr -d ' ' | head -1 || true)"
+        local sname_first="${sname%% *}"
+        if [[ -n "$sname_first" && -f "/etc/letsencrypt/live/${sname_first}/fullchain.pem" ]]; then
+            PANEL_CERT="/etc/letsencrypt/live/${sname_first}/fullchain.pem"
+            PANEL_CERT_KEY="/etc/letsencrypt/live/${sname_first}/privkey.pem"
+            PANEL_CERT_DIR="/etc/letsencrypt/live/${sname_first}"
+            PANEL_HOST="$sname_first"
+            return 0
+        fi
+    fi
+
     local d crt key
-    for d in "$base"/*/; do
-        [[ -d "$d" ]] || continue
-        crt="$d/fullchain.pem"; key="$d/privkey.pem"
-        [[ -f "$crt" && -f "$key" ]] || continue
-        PANEL_CERT="$crt"; PANEL_CERT_KEY="$key"; PANEL_CERT_DIR="${d%/}"
-        break
+    for d in "${dirs[@]}"; do
+        local sub
+        for sub in "$d"/*/; do
+            [[ -d "$sub" ]] || continue
+            crt="$sub/fullchain.pem"; key="$sub/privkey.pem"
+            [[ -f "$crt" && -f "$key" ]] || continue
+            PANEL_CERT="$crt"; PANEL_CERT_KEY="$key"; PANEL_CERT_DIR="${sub%/}"
+            break 2
+        done
     done
     [[ -n "$PANEL_CERT" ]] || return 0
 
@@ -407,16 +432,6 @@ gen_hex() { openssl rand -hex "${1:-4}"; }
 gen_password() {
     local len="${1:-16}"
     openssl rand -base64 48 2>/dev/null | tr -d '[:space:]' | tr '+/' '-_' | cut -c1-"$len"
-}
-
-# psk для Shadowsocks-2022: стандартный base64 32 байт (44 символа с '='
-# padding). Xray и панель декодируют ключ как base64.StdEncoding в ровно
-# 32 байта; base64url без padding (43 символа) ядро отвергает:
-# «illegal base64 data» при старте.
-gen_psk() {
-    local key
-    key="$(openssl rand 32 | base64 | tr -d '\n')"
-    printf '%s' "$key"
 }
 
 # x25519_keypair — пара ключей REALITY/WireGuard.
@@ -642,13 +657,12 @@ make_client_data() {
     CLIENT_EMAIL="$2"
     CLIENT_SUBID="$3"
     CLIENT_FLOW="${4:-}"
-    CLIENT_ID=""; CLIENT_PW=""; CLIENT_AUTH=""; CLIENT_PSK=""
+    CLIENT_ID=""; CLIENT_PW=""; CLIENT_AUTH=""
     CLIENT_PRIV=""; CLIENT_PUB=""; CLIENT_SECRET=""
     case "$proto" in
         vless)  CLIENT_ID="$(gen_uuid)" ;;
         vmess)  CLIENT_ID="$(gen_uuid)" ;;
         trojan) CLIENT_PW="$(gen_password 24)" ;;
-        shadowsocks) CLIENT_PSK="$(gen_psk)" ;;
         hysteria) CLIENT_AUTH="$(gen_password 24)" ;;
         wireguard)
             x25519_keypair || die "Не удалось сгенерировать ключи WireGuard."
@@ -674,9 +688,6 @@ gen_client() {
         trojan)
             printf '{\n    "password": "%s",\n    "email": "%s",\n    "limitIp": 0,\n    "totalGB": 0,\n    "expiryTime": 0,\n    "enable": true,\n    "tgId": 0,\n    "subId": "%s",\n    "comment": "",\n    "reset": 0\n  }' "$CLIENT_PW" "$CLIENT_EMAIL" "$CLIENT_SUBID"
             ;;
-        shadowsocks)
-            printf '{\n    "method": "",\n    "password": "%s",\n    "email": "%s",\n    "limitIp": 0,\n    "totalGB": 0,\n    "expiryTime": 0,\n    "enable": true,\n    "tgId": 0,\n    "subId": "%s",\n    "comment": "",\n    "reset": 0\n  }' "$CLIENT_PSK" "$CLIENT_EMAIL" "$CLIENT_SUBID"
-            ;;
         hysteria)
             printf '{\n    "auth": "%s",\n    "email": "%s",\n    "limitIp": 0,\n    "totalGB": 0,\n    "expiryTime": 0,\n    "enable": true,\n    "tgId": 0,\n    "subId": "%s",\n    "comment": "",\n    "reset": 0\n  }' "$CLIENT_AUTH" "$CLIENT_EMAIL" "$CLIENT_SUBID"
             ;;
@@ -698,12 +709,6 @@ gen_mtproto_secret() {
     printf 'ee%s%s' "$(openssl rand -hex 16)" "$(printf '%s' "$domain" | od -An -tx1 | tr -d ' \n')"
 }
 
-# gen_ss_inbound_settings <method> <password> <client_json> — settings Shadowsocks.
-gen_ss_inbound_settings() {
-    local method="$1" password="$2" client="$3"
-    printf '{\n  "method": "%s",\n  "password": "%s",\n  "network": "tcp,udp",\n  "clients": [\n%s\n  ],\n  "ivCheck": false\n}' "$method" "$password" "$client"
-}
-
 # build_settings <protocol> <client_json> <доп.аргументы...>
 # Печатает JSON "settings" для inbound.
 build_settings() {
@@ -717,15 +722,6 @@ build_settings() {
             ;;
         trojan)
             printf '{\n  "clients": [\n%s\n  ],\n  "fallbacks": []\n}' "$client"
-            ;;
-        shadowsocks)
-            local method="${3:-aes-256-gcm}"
-            local password=""
-            case "$method" in
-                2022-blake3-*) password="$(gen_psk)" ;;
-                *) password="$(gen_password 24)" ;;
-            esac
-            gen_ss_inbound_settings "$method" "$password" "$client"
             ;;
         hysteria)
             printf '{\n  "version": 2,\n  "clients": [\n%s\n  ]\n}' "$client"
@@ -801,7 +797,7 @@ cert_covers() {
 }
 
 # issue_selfsigned_channel_cert <домен> — self-signed сертификат для инбаунда
-# в /root/cert/inbounds/<домен>/ (запасной вариант, когда acme недоступен).
+# в /root/cert/inbounds/<домен>/ (запасной вариант, когда LE недоступен).
 issue_selfsigned_channel_cert() {
     local domain="$1" dir
     dir="/root/cert/inbounds/${domain}"
@@ -820,16 +816,18 @@ issue_selfsigned_channel_cert() {
     ok "Self-signed сертификат инбаунда: $dir"
 }
 
-# issue_domain_cert <домен> — сертификат инбаунда через acme.sh (ZeroSSL, HTTP-01).
-# Перед выпуском проверяет, что DNS уже резолвится на IP сервера.
+# issue_domain_cert <домен> — сертификат инбаунда через Let's Encrypt (certbot,
+# HTTP-01). Перед выпуском проверяет, что DNS уже резолвится на IP сервера.
+# Порт 80 нужен certbot --standalone: если его занимает nginx, nginx временно
+# останавливается и возвращается после выпуска (сайты не должны использовать 80).
 issue_domain_cert() {
     local domain="$1"
-    local ACME_SH="${HOME}/.acme.sh/acme.sh"
     local CERT_DIR="/root/cert/inbounds/${domain}"
 
     if port_in_use 80 tcp; then
-        warn "Порт 80 занят — HTTP-01 acme может не пройти."
-        confirm "Продолжить всё равно?" || return 1
+        warn "Порт 80 занят — HTTP-01 Let's Encrypt требует свободный порт."
+        warn "Если порт держит nginx, он будет временно остановлен на время выпуска."
+        confirm "Продолжить?" || return 1
     fi
 
     # Проверка DNS: запись A должна указывать на этот сервер
@@ -843,41 +841,63 @@ issue_domain_cert() {
         confirm "Продолжить всё равно?" || return 1
     fi
 
-    if [[ ! -x "$ACME_SH" ]]; then
-        info "Устанавливаем acme.sh..."
-        curl -s https://get.acme.sh | sh >/dev/null 2>&1 || true
-        [[ -x "$ACME_SH" ]] || { warn "acme.sh не установился."; return 1; }
-    fi
+    command -v certbot >/dev/null 2>&1 || {
+        info "certbot не установлен — устанавливаем..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1 && apt-get install -y certbot >/dev/null 2>&1 || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache certbot >/dev/null 2>&1 || true
+        fi
+        command -v certbot >/dev/null 2>&1 || { warn "certbot не установился."; return 1; }
+    }
 
     local email=""
-    ask "E-mail для ZeroSSL (регистрация в CA)" "" email
-    [[ -n "$email" ]] || { warn "E-mail не указан — ZeroSSL недоступен."; return 1; }
+    ask "E-mail для Let's Encrypt (необязательно, для продлений)" "" email
 
+    local nginx_stopped=0
+    if port_in_use 80 tcp && systemctl is-active --quiet nginx 2>/dev/null; then
+        info "Останавливаем nginx на время выпуска (освобождаем порт 80)..."
+        systemctl stop nginx
+        nginx_stopped=1
+        sleep 1
+    fi
     firewall_port_open 80 tcp 2>/dev/null || true
     mkdir -p "$CERT_DIR"
-    "$ACME_SH" --set-default-ca --server zerossl >/dev/null 2>&1
-    "$ACME_SH" --register-account -m "$email" >/dev/null 2>&1 || true
-    if "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 --server zerossl --force; then
-        "$ACME_SH" --installcert --force -d "$domain" \
-            --key-file "$CERT_DIR/privkey.pem" \
-            --fullchain-file "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 || true
-        # При продлении acme.sh будет обновлять копии в каталоге инбаунда
-        "$ACME_SH" --installcert --force -d "$domain" \
-            --reloadcmd "mkdir -p '$CERT_DIR' && cp -f '$HOME/.acme.sh/${domain}/${domain}.key' '$CERT_DIR/privkey.pem' && cp -f '$HOME/.acme.sh/${domain}/fullchain.cer' '$CERT_DIR/fullchain.pem'" >/dev/null 2>&1 || true
-        if [[ -f "$CERT_DIR/fullchain.pem" && -f "$CERT_DIR/privkey.pem" ]]; then
-            chmod 600 "$CERT_DIR/privkey.pem"
-            chmod 644 "$CERT_DIR/fullchain.pem"
-            ok "Выпущен сертификат инбаунда для $domain."
-            return 0
-        fi
+    rm -rf "/etc/letsencrypt/live/${domain}" >/dev/null 2>&1 || true
+
+    local ok_issue=0
+    if [[ -n "$email" ]]; then
+        certbot certonly --standalone --preferred-challenges http -d "$domain" \
+            -m "$email" --agree-tos --no-eff-email --non-interactive --force-renewal \
+            >/dev/null 2>&1 && ok_issue=1
+    else
+        certbot certonly --standalone --preferred-challenges http -d "$domain" \
+            --register-unsafely-without-email --agree-tos --no-eff-email \
+            --non-interactive --force-renewal >/dev/null 2>&1 && ok_issue=1
     fi
-    warn "Не удалось выпустить сертификат для $domain."
+
+    if [[ "$nginx_stopped" == "1" ]]; then
+        systemctl start nginx
+        sleep 1
+    fi
+
+    if [[ "$ok_issue" == "1" && -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+        # certbot настраивает авто-продление; в каталог инбаунда кладём
+        # симлинки, чтобы обновления сертификата подхватывались автоматически.
+        ln -sf "/etc/letsencrypt/live/${domain}/fullchain.pem" "$CERT_DIR/fullchain.pem"
+        ln -sf "/etc/letsencrypt/live/${domain}/privkey.pem" "$CERT_DIR/privkey.pem"
+        chmod 644 "$CERT_DIR/fullchain.pem"
+        chmod 600 "$CERT_DIR/privkey.pem"
+        ok "Выпущен сертификат Let's Encrypt для $domain."
+        return 0
+    fi
+    warn "Не удалось выпустить сертификат Let's Encrypt для $domain."
     return 1
 }
 
 # ensure_channel_cert <домен> — гарантирует наличие сертификата для инбаунда.
 # Приоритет: сертификат панели (если покрывает домен) → существующий сертификат
-# инбаунда → выпуск acme.sh (ZeroSSL) → self-signed.
+# инбаунда → выпуск Let's Encrypt (certbot) → self-signed.
 ensure_channel_cert() {
     local domain="$1" dir
     dir="/root/cert/inbounds/${domain}"
@@ -892,7 +912,7 @@ ensure_channel_cert() {
         return 0
     fi
     CHANNEL_CERT_DIR="$dir"
-    if confirm "Выпустить сертификат для $domain (acme.sh/ZeroSSL, нужна DNS-запись)?" "y"; then
+    if confirm "Выпустить сертификат для $domain (Let's Encrypt, нужна DNS-запись)?" "y"; then
         issue_domain_cert "$domain" \
             && { ok "Сертификат инбаунда готов: $dir"; return 0; }
         warn "Выпуск не удался — используем self-signed (не рекомендуется для клиентов)."
@@ -925,39 +945,57 @@ reality_settings() {
 # build_stream <network> <security> <path> <host> <cert_sni>
 # Печатает JSON "streamSettings". Доп. значения для security кладутся в глобальные
 # переменные (REALITY_*).
+#
+# Формат перенесён из эталона x-ui-pro (GFW4Fun/mozaroc): для инбаундов за nginx
+# добавляются host/authority (домен), externalProxy [{forceTls, dest: домен, port: 443}]
+# и acceptProxyProtocol для tcp-инбаундов при stream-мастере (nginx шлёт PROXY-заголовок).
 build_stream() {
     local network="$1" security="${2:-none}" path="${3:-/}" host="${4:-}" sni="${5:-}"
     [[ "$path" == / ]] && path="/"
+    # externalProxy — как в эталоне: tls для http-транспортов, same для tcp (reality/tls)
+    local ext="" accept_pp="false"
+    if [[ -n "$USE_NGINX" ]]; then
+        local ft="same"
+        [[ "$network" != "tcp" ]] && ft="tls"
+        ext=$(printf ',\n  "externalProxy": [\n    {\n      "forceTls": "%s",\n      "dest": "%s",\n      "port": %s,\n      "remark": ""\n    }\n  ]' "$ft" "${PANEL_HOST:-$(external_addr)}" "${STREAM_MASTER_PORT:-443}")
+        # PROXY-заголовок шлёт только stream-мастер; в legacy-режиме (passthrough
+        # без мастера) его нет — acceptProxyProtocol должен оставаться false.
+        if [[ "$network" == "tcp" && "$STREAM_443_MASTER" == "1" ]]; then
+            accept_pp="true"
+        fi
+    fi
     case "$network" in
         tcp)
             if [[ "$security" == "reality" ]]; then
                 build_reality_settings_json
-                printf '{\n  "network": "tcp",\n  "tcpSettings": {\n    "header": {\n      "type": "none"\n    }\n  },\n  "security": "reality",\n  "realitySettings": %s\n}' "$REALITY_SETTINGS_JSON"
+                printf '{\n  "network": "tcp",\n  "tcpSettings": {\n    "acceptProxyProtocol": %s,\n    "header": {\n      "type": "none"\n    }\n  },\n  "security": "reality",\n  "realitySettings": %s%b\n}' "$accept_pp" "$REALITY_SETTINGS_JSON" "$ext"
             else
-                printf '{\n  "network": "tcp",\n  "tcpSettings": {\n    "header": {\n      "type": "none"\n    }\n  },\n  "security": "%s"' "$security"
+                printf '{\n  "network": "tcp",\n  "tcpSettings": {\n    "acceptProxyProtocol": %s,\n    "header": {\n      "type": "none"\n    }\n  },\n  "security": "%s"' "$accept_pp" "$security"
                 [[ "$security" == "tls" ]] && printf ',\n  "tlsSettings": %s' "$(tls_settings "$sni")"
-                printf '\n}'
+                printf '%b\n}' "$ext"
             fi
             ;;
         ws)
-            printf '{\n  "network": "ws",\n  "wsSettings": {\n    "acceptProxyProtocol": false,\n    "path": "%s",\n    "host": "%s",\n    "headers": {},\n    "heartbeatPeriod": 0\n  },\n  "security": "%s"' "$path" "$host" "$security"
+            printf '{\n  "network": "ws",\n  "wsSettings": {\n    "acceptProxyProtocol": false,\n    "path": "%s",\n    "host": "%s",\n    "headers": {}\n  },\n  "security": "%s"' "$path" "$host" "$security"
             [[ "$security" == "tls" ]] && printf ',\n  "tlsSettings": %s' "$(tls_settings "$sni")"
-            printf '\n}'
+            printf '%b\n}' "$ext"
             ;;
         grpc)
             printf '{\n  "network": "grpc",\n  "grpcSettings": {\n    "serviceName": "%s",\n    "authority": "%s",\n    "multiMode": false\n  },\n  "security": "%s"' "$path" "$host" "$security"
             [[ "$security" == "tls" ]] && printf ',\n  "tlsSettings": %s' "$(tls_settings "$sni")"
-            printf '\n}'
+            printf '%b\n}' "$ext"
             ;;
         xhttp)
-            printf '{\n  "network": "xhttp",\n  "xhttpSettings": {\n    "path": "%s",\n    "host": "%s",\n    "mode": "auto",\n    "headers": {},\n    "xPaddingBytes": "100-1000"\n  },\n  "security": "%s"' "$path" "$host" "$security"
+            # Полностью как в эталоне x-ui-pro: mode packet-up, спец-sockopt,
+            # слушает на unix-сокете (port=0 в инбаунде), TLS терминирует nginx.
+            printf '{\n  "network": "xhttp",\n  "xhttpSettings": {\n    "path": "%s",\n    "host": "%s",\n    "headers": {},\n    "scMaxBufferedPosts": 30,\n    "scMaxEachPostBytes": "1000000",\n    "noSSEHeader": false,\n    "xPaddingBytes": "100-1000",\n    "mode": "packet-up"\n  },\n  "sockopt": {\n    "acceptProxyProtocol": false,\n    "tcpFastOpen": true,\n    "mark": 0,\n    "tproxy": "off",\n    "tcpMptcp": true,\n    "tcpNoDelay": true,\n    "domainStrategy": "UseIP",\n    "tcpMaxSeg": 1440,\n    "dialerProxy": "",\n    "tcpKeepAliveInterval": 0,\n    "tcpKeepAliveIdle": 300,\n    "tcpUserTimeout": 10000,\n    "tcpcongestion": "bbr",\n    "V6Only": false,\n    "tcpWindowClamp": 600,\n    "interface": ""\n  },\n  "security": "%s"' "$path" "$host" "$security"
             [[ "$security" == "tls" ]] && printf ',\n  "tlsSettings": %s' "$(tls_settings "$sni")"
-            printf '\n}'
+            printf '%b\n}' "$ext"
             ;;
         httpupgrade)
             printf '{\n  "network": "httpupgrade",\n  "httpupgradeSettings": {\n    "path": "%s",\n    "host": "%s",\n    "headers": {}\n  },\n  "security": "%s"' "$path" "$host" "$security"
             [[ "$security" == "tls" ]] && printf ',\n  "tlsSettings": %s' "$(tls_settings "$sni")"
-            printf '\n}'
+            printf '%b\n}' "$ext"
             ;;
         kcp)
             printf '{\n  "network": "kcp",\n  "kcpSettings": {\n    "mtu": 1350,\n    "tti": 20,\n    "uplinkCapacity": 5,\n    "downlinkCapacity": 20,\n    "cwndMultiplier": 1,\n    "maxSendingWindow": 2097152,\n    "header": {\n      "type": "none"\n    }\n  },\n  "security": "none"\n}'
@@ -1101,12 +1139,6 @@ load_existing_client() {
             trojan)
                 CLIENT_PW="$(json_extract "$block" password)"
                 ;;
-            shadowsocks)
-                CLIENT_PSK="$(json_extract "$block" password)"
-                local m=""
-                m="$(json_extract "$settings" method)"
-                [[ -n "$m" ]] && SS_METHOD="$m"
-                ;;
             hysteria)
                 CLIENT_AUTH="$(json_extract "$block" auth)"
                 ;;
@@ -1128,7 +1160,6 @@ load_existing_client() {
             vless)      CLIENT_ID="$uu"; CLIENT_FLOW="$fl" ;;
             vmess)      CLIENT_ID="$uu" ;;
             trojan)     CLIENT_PW="$pw" ;;
-            shadowsocks) CLIENT_PSK="$pw" ;;
             hysteria)   CLIENT_AUTH="$au" ;;
             wireguard)  CLIENT_PRIV="$wgpk"; CLIENT_PUB="$wgpub" ;;
             mtproto)    CLIENT_SECRET="$se" ;;
@@ -1150,11 +1181,8 @@ db_add_client_records() {
     if [[ "$PROTOCOL" == "wireguard" ]]; then
         wg_pk="$CLIENT_PRIV"; wg_pub="$CLIENT_PUB"; wg_ips="10.0.0.2/32"; wg_ka="25"
     fi
-    # Колонка clients.password: панель для Shadowsocks берёт пароль клиента
-    # именно отсюда (в settings её пароль идёт в clients JSON, но при генерации
-    # конфига клиенты пересобираются из таблицы clients). Для SS — это CLIENT_PSK.
+    # Колонка clients.password: пароль клиента (для SS панель брала его отсюда).
     local cl_pw="$CLIENT_PW"
-    [[ "$PROTOCOL" == "shadowsocks" ]] && cl_pw="$CLIENT_PSK"
     # email уже есть в clients? (уникальность) — обновить, иначе вставить
     local existing
     existing="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
@@ -1351,7 +1379,7 @@ gen_link_vless() {
     case "$TRANSPORT" in
         ws)          q+=("path=${WS_PATH}" "host=${WS_HOST:-}") ;;
         grpc)        q+=("serviceName=${WS_PATH}") ;;
-        xhttp)       q+=("path=${WS_PATH}" "host=${WS_HOST:-}" "mode=auto") ;;
+        xhttp)       q+=("path=${WS_PATH}" "host=${WS_HOST:-}" "mode=packet-up") ;;
         httpupgrade) q+=("path=${WS_PATH}" "host=${WS_HOST:-}") ;;
     esac
     q+=("encryption=none")
@@ -1410,37 +1438,6 @@ gen_link_trojan() {
     printf '%s?%s#%s\n' "$link" "$(join_q "${q[@]}")" "$(urlencode "$REMARK")"
 }
 
-# gen_link_ss — ss:// ссылка (SIP002).
-gen_link_ss() {
-    local ln ln_addr ln_port method="$SS_METHOD" server_psk="" userinfo=""
-    ln="$(link_external)"
-    ln_addr="${ln%:*}"
-    ln_port="${ln##*:}"
-    if [[ "$method" == 2022-* ]]; then
-        # SIP022: метод и пароли percent-encoded, без base64
-        server_psk="$(db_get_inbound_server_psk "$INBOUND_ID")"
-        userinfo="$(urlencode "$method"):$(urlencode "$server_psk"):$(urlencode "$CLIENT_PSK")"
-    else
-        userinfo="$(b64url "$method:$CLIENT_PSK")"
-    fi
-    local q=()
-    # Инбаунды за прокси (nginx-мастер 443) терминируют TLS на nginx — клиенту
-    # нужен security=tls (иначе не-TLS ws-запрос не пройдёт через passthrough).
-    if [[ "$USE_NGINX" == "1" ]]; then
-        q+=("security=tls")
-        [[ -n "${PANEL_HOST:-}" ]] && q+=("sni=${PANEL_HOST}")
-    fi
-    case "$TRANSPORT" in
-        ws) q+=("type=ws" "path=${WS_PATH}" "host=${WS_HOST:-}") ;;
-    esac
-    local link="ss://${userinfo}@${ln_addr}:${ln_port}"
-    if ((${#q[@]} > 0)); then
-        printf '%s?%s#%s\n' "$link" "$(join_q "${q[@]}")" "$(urlencode "$REMARK")"
-    else
-        printf '%s#%s\n' "$link" "$(urlencode "$REMARK")"
-    fi
-}
-
 # gen_link_hysteria2 — hysteria2:// ссылка.
 gen_link_hysteria2() {
     local addr link
@@ -1466,12 +1463,6 @@ gen_link_wireguard() {
 # gen_link_mtproto — tg://proxy (без remark — Telegram не принимает).
 gen_link_mtproto() {
     printf 'tg://proxy?server=%s&port=%s&secret=%s\n' "$(external_addr)" "$PORT" "$CLIENT_SECRET"
-}
-
-# db_get_inbound_server_psk <inbound_id> — серверный пароль Shadowsocks из settings.
-db_get_inbound_server_psk() {
-    sqlite3 "$XUI_DB" "SELECT settings FROM inbounds WHERE id = $1;" 2>/dev/null \
-        | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 # db_get_wg_secret_key <inbound_id> — secretKey WireGuard из settings.
@@ -1522,7 +1513,7 @@ menu_protocol() {
     banner ""
     banner "  Выбор протокола Xray-инбаунда (панель 3x-ui v3.6+)"
     banner "  Все инбаунды поддерживаются панелью; ссылки генерируются для"
-    banner "  vless/vmess/trojan/ss/hy2/wireguard/mtproto (http/mixed — без ссылок)."
+    banner "  vless/vmess/trojan/hy2/wireguard/mtproto (http/mixed — без ссылок)."
     banner ""
     cat <<'MENU'
    1)  VLESS + REALITY (TCP, XTLS Vision)
@@ -1540,17 +1531,15 @@ menu_protocol() {
   13)  Trojan + TCP (TLS)
   14)  Trojan + WebSocket (TLS)
   15)  Trojan + gRPC (TLS)
-  16)  Shadowsocks + TCP
-  17)  Shadowsocks + WebSocket
-  18)  Hysteria2 (UDP, TLS)
-  19)  WireGuard (UDP)
-  20)  Mixed SOCKS+HTTP (TCP)
-  21)  HTTP proxy (TCP)
-  22)  MTProto (Telegram)
+  16)  Hysteria2 (UDP, TLS)
+  17)  WireGuard (UDP)
+  18)  Mixed SOCKS+HTTP (TCP)
+  19)  HTTP proxy (TCP)
+  20)  MTProto (Telegram)
    q)   Выход
 MENU
     local ans=""
-    read -r -p "Ваш выбор [1-22, q]: " ans || exit 0
+    read -r -p "Ваш выбор [1-20, q]: " ans || exit 0
     case "$ans" in
         1) PROTOCOL=vless; TRANSPORT=tcp; SECURITY=reality; CLIENT_FLOW=xtls-rprx-vision ;;
         2) PROTOCOL=vless; TRANSPORT=tcp; SECURITY=tls;    CLIENT_FLOW=xtls-rprx-vision ;;
@@ -1567,13 +1556,11 @@ MENU
         13) PROTOCOL=trojan; TRANSPORT=tcp; SECURITY=tls ;;
         14) PROTOCOL=trojan; TRANSPORT=ws; SECURITY=tls ;;
         15) PROTOCOL=trojan; TRANSPORT=grpc; SECURITY=tls ;;
-        16) PROTOCOL=shadowsocks; TRANSPORT=tcp; SECURITY=none ;;
-        17) PROTOCOL=shadowsocks; TRANSPORT=ws; SECURITY=none ;;
-        18) PROTOCOL=hysteria; TRANSPORT=hysteria; SECURITY=tls ;;
-        19) PROTOCOL=wireguard; TRANSPORT=tcp; SECURITY=none ;;
-        20) PROTOCOL=mixed; TRANSPORT=tcp; SECURITY=none ;;
-        21) PROTOCOL=http; TRANSPORT=tcp; SECURITY=none ;;
-        22) PROTOCOL=mtproto; TRANSPORT=tcp; SECURITY=none ;;
+        16) PROTOCOL=hysteria; TRANSPORT=hysteria; SECURITY=tls ;;
+        17) PROTOCOL=wireguard; TRANSPORT=tcp; SECURITY=none ;;
+        18) PROTOCOL=mixed; TRANSPORT=tcp; SECURITY=none ;;
+        19) PROTOCOL=http; TRANSPORT=tcp; SECURITY=none ;;
+        20) PROTOCOL=mtproto; TRANSPORT=tcp; SECURITY=none ;;
         q|Q|exit) exit 0 ;;
         *) warn "Неверный выбор."; menu_protocol ;;
     esac
@@ -1672,6 +1659,8 @@ nginx_add_http_location() {
     # inbound-xray.sh: универсальная regex-location WS/gRPC/XHTTP/HTTPUpgrade
     # Именованные capture (?<fwdport>...) — позиционные $1 внутри if не работают.
     location ~ ^/(?<fwdport>[0-9]+)/(?<fwdpath>.*)$ {
+        client_max_body_size 0;
+        client_body_timeout 1d;
         proxy_http_version 1.1;
         proxy_buffering off;
         proxy_request_buffering off;
@@ -1718,6 +1707,53 @@ BLOCK
         systemctl reload nginx >/dev/null 2>&1 && ok "nginx перезагружен."
     fi
     ok "Добавлена универсальная regex-location (grpc_pass + buffering off) в $NGINX_SNIPPET"
+}
+
+# nginx_add_xhttp_location — location XHTTP → unix-сокет (как в эталоне x-ui-pro).
+# XHTTP-инбаунд слушает на /dev/shm/uds2023.sock, nginx grpc_pass grpc://unix:...
+# доставляет трафик на сокет; TLS терминируется nginx.
+nginx_add_xhttp_location() {
+    [[ -f "$NGINX_SNIPPET" ]] || return 0
+    local path="${XHTTP_PATH:-$WS_PATH}"
+    [[ -n "$path" ]] || return 0
+    if grep -Fqs "grpc_pass grpc://unix:/dev/shm/uds2023.sock;" "$NGINX_SNIPPET"; then
+        info "XHTTP location (grpc_pass unix-сокет) уже настроена."
+        return 0
+    fi
+    local block
+    block=$(cat <<BLOCK
+
+    # inbound-xray.sh: XHTTP через unix-сокет (эталон x-ui-pro)
+    location ${path} {
+        grpc_pass grpc://unix:/dev/shm/uds2023.sock;
+        grpc_buffer_size         16k;
+        grpc_socket_keepalive    on;
+        grpc_read_timeout        1h;
+        grpc_send_timeout        1h;
+        grpc_set_header Connection         "";
+        grpc_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
+        grpc_set_header X-Forwarded-Proto  \$scheme;
+        grpc_set_header X-Forwarded-Port   \$server_port;
+        grpc_set_header Host               \$host;
+        grpc_set_header X-Forwarded-Host   \$host;
+    }
+BLOCK
+)
+    local bak
+    bak="$(mktemp)"
+    cp -a "$NGINX_SNIPPET" "$bak" || return 1
+    printf '%s\n' "$block" >> "$NGINX_SNIPPET" || { cp -a "$bak" "$NGINX_SNIPPET"; return 1; }
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
+        warn "nginx -t не прошёл — откат конфигурации."
+        warn "$NGINX_TEST_ERR"
+        cp -a "$bak" "$NGINX_SNIPPET"
+        return 1
+    fi
+    rm -f "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 && ok "nginx перезагружен."
+    fi
+    ok "Добавлен XHTTP location ${path} → grpc://unix:/dev/shm/uds2023.sock в $NGINX_SNIPPET"
 }
 
 # nginx_ensure_snippet_included — подключает сниппет WS/gRPC regex-location'ов
@@ -1780,6 +1816,11 @@ nginx_reality_target_server() {
             printf '    ssl_certificate_key %s;\n' "$key"
         fi
         printf '%s\n' '    ssl_protocols TLSv1.2 TLSv1.3;'
+        printf '%s\n' ''
+        # Защита: target-порт — только для REALITY (SNI основного домена).
+        # Прочие хосты (панель, посторонние) — закрываем 444.
+        printf '%s\n' "    if (\$host != ${sni}) { return 444; }"
+        printf '%s\n' "    if (\$ssl_server_name !~* ^(.+\\\\.)?${sni//./\\\\.}\$ ) { return 444; }"
         printf '%s\n' '}'
     } > "$conf"
     if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
@@ -1951,14 +1992,23 @@ server {
     tmp="$(mktemp)"
     bak="$(mktemp)"
     cp -a "$NGINX_STREAM" "$bak" || return 1
+    # default → REALITY-инбаунд (при SNI, не совпавшем ни с одним каналом, —
+    # это защита от недоверенных хостов); если REALITY-инбаундов нет, панель.
+    local real_def="${REALITY_DEFAULT_PORT:-}"
+    if [[ -z "$real_def" ]]; then
+        real_def="$(sqlite3 "$XUI_DB" "SELECT port FROM inbounds WHERE protocol='vless' AND stream_settings LIKE '%realitySettings%' ORDER BY id LIMIT 1;" 2>/dev/null || true)"
+    fi
+    [[ -n "$real_def" ]] || real_def="$PANEL_SSL_PORT"
     cat > "$tmp" <<EOF
 # inbound-xray.sh: stream-443 master (все внешние TLS-потоки идут на ${STREAM_MASTER_PORT:-443})
 map \$ssl_preread_server_name \$xui_backend {
-${map_lines}    default  127.0.0.1:${PANEL_SSL_PORT};
+${map_lines}    default  127.0.0.1:${real_def};
 }
 
 server {
     listen ${STREAM_MASTER_PORT:-443};
+    proxy_protocol on;
+    set_real_ip_from unix:;
     proxy_pass \$xui_backend;
     ssl_preread on;
 }
@@ -1979,6 +2029,46 @@ EOF
     rm -f "$tmp" "$bak"
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
         systemctl reload nginx >/dev/null 2>&1 && ok "nginx (stream-мастер) перезагружен."
+    fi
+}
+
+# stream_master_apply_proxy_protocol — синхронизирует acceptProxyProtocol инбаундов
+# с proxy_protocol stream-мастера. После включения proxy_protocol на 443 nginx шлёт
+# PROXY-заголовок ко ВСЕМ tcp-маршрутам мастера: tcp+reality/tls инбаунды с SNI
+# обязаны иметь acceptProxyProtocol=true, иначе xray рвёт соединения. Инбаунды без
+# SNI (passthrough-блоки на своих портах) — остаются false.
+stream_master_apply_proxy_protocol() {
+    [[ -f "$NGINX_STREAM" ]] || return 0
+    local rows="" row="" id="" ss="" sni="" accept="" cur="" settings="" new_settings=""
+    rows="$(sqlite3 "$XUI_DB" "SELECT id, replace(stream_settings, char(10), char(32)) FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1' AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
+    while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        id="${row%%|*}"; ss="${row#*|}"
+        printf '%s' "$ss" | grep -q '"network"[[:space:]]*:[[:space:]]*"tcp"' || continue
+        printf '%s' "$ss" | grep -qE '"security"[[:space:]]*:[[:space:]]*"(reality|tls)"' || continue
+        sni="$(printf '%s' "$ss" | sed -nE 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
+        if [[ -z "$sni" ]]; then
+            sni="$(printf '%s' "$ss" | sed -nE 's/.*"serverName"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
+        fi
+        if [[ -n "$sni" ]]; then
+            accept="true"
+        else
+            accept="false"
+        fi
+        cur="$(printf '%s' "$ss" | grep -oE '"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)' | head -1)"
+        [[ "$cur" == "$accept" ]] && continue
+        settings="$(sqlite3 "$XUI_DB" "SELECT stream_settings FROM inbounds WHERE id = $id;" 2>/dev/null || true)"
+        if printf '%s' "$settings" | grep -q '"acceptProxyProtocol"'; then
+            new_settings="$(printf '%s' "$settings" | sed -E 's/"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)/"acceptProxyProtocol": '"$accept"'/')"
+        else
+            new_settings="$(printf '%s' "$settings" | sed 's/"tcpSettings"[[:space:]]*:[[:space:]]*{/"tcpSettings": {\n    "acceptProxyProtocol": '"$accept"',/')"
+        fi
+        sqlite3 "$XUI_DB" "UPDATE inbounds SET stream_settings = '$(sql_escape "$new_settings")' WHERE id = $id;" \
+            || warn "Не удалось обновить acceptProxyProtocol (id=$id)."
+        info "acceptProxyProtocol=$accept проставлен для инбаунда id=$id (stream-мастер с proxy_protocol)."
+    done <<< "$rows"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui >/dev/null 2>&1; then
+        restart_xui
     fi
 }
 
@@ -2044,6 +2134,7 @@ nginx_stream_master_setup() {
 
     STREAM_443_MASTER=1
     nginx_stream_master_rebuild || { STREAM_443_MASTER=""; return 1; }
+    stream_master_apply_proxy_protocol || true
 
     local conf="$NGINX_CONF"
     if [[ -z "$conf" || ! -f "$conf" ]]; then
@@ -2293,7 +2384,6 @@ print_summary() {
         vless)       link="$(gen_link_vless)" ;;
         vmess)       link="$(gen_link_vmess)" ;;
         trojan)      link="$(gen_link_trojan)" ;;
-        shadowsocks) link="$(gen_link_ss)" ;;
         hysteria)    link="$(gen_link_hysteria2)" ;;
         wireguard)   link="$(gen_link_wireguard)" ;;
         mtproto)     link="$(gen_link_mtproto)" ;;
@@ -2315,10 +2405,6 @@ print_summary() {
             ;;
     esac
 
-    [[ "$PROTOCOL" == "shadowsocks" ]] && {
-        printf '%s\n' "  Метод Shadowsocks: $SS_METHOD"
-        printf '%s\n' "  Серверный пароль:  $(db_get_inbound_server_psk "$INBOUND_ID")"
-    }
     [[ "$SECURITY" == "tls" ]] && printf '%s\n' "  Сертификат: ${PANEL_CERT:-self-signed}"
     [[ "$SECURITY" == "reality" ]] && {
         printf '%s\n' "  REALITY: publicKey=${REALITY_PUBLIC_KEY} shortId=${REALITY_SHORT_ID} serverName=${REALITY_SNI}"
@@ -2409,7 +2495,7 @@ write_panel_conf() {
     local listen_dir="    listen ${PROXY_PORT};"
     local ssl_lines=""
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
-        listen_dir="    listen 127.0.0.1:${PANEL_SSL_PORT} ssl http2;"
+        listen_dir="    listen 127.0.0.1:${PANEL_SSL_PORT} ssl http2 proxy_protocol;"
         if [[ -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" ]]; then
             ssl_lines="    ssl_certificate     ${PANEL_CERT};
     ssl_certificate_key ${PANEL_CERT_KEY};"
@@ -2645,8 +2731,15 @@ db_add_host_record() {
     esac
     sec="$SECURITY"
     local addr sni path
-    addr="$(external_addr)"
-    sni="${SNI:-$addr}"
+    # за nginx: адрес/SNI = домен, security=tls (как в эталоне)
+    if [[ -n "$USE_NGINX" ]] && [[ "$TRANSPORT" == "ws" || "$TRANSPORT" == "grpc" || "$TRANSPORT" == "xhttp" || "$TRANSPORT" == "httpupgrade" ]]; then
+        addr="${PANEL_HOST:-$(external_addr)}"
+        sec="tls"
+        sni="$addr"
+    else
+        addr="$(external_addr)"
+        sni="${SNI:-$addr}"
+    fi
     path=""
     [[ -n "$WS_PATH" ]] && path="$WS_PATH"
     sqlite3 "$XUI_DB" "INSERT INTO hosts
@@ -2721,33 +2814,14 @@ setup_subscription() {
 create_channel() {
     # Сброс данных предыдущего клиента
     CLIENT_EMAIL=""; CLIENT_SUBID=""; CLIENT_FLOW=""
-    CLIENT_ID=""; CLIENT_PW=""; CLIENT_AUTH=""; CLIENT_PSK=""
+    CLIENT_ID=""; CLIENT_PW=""; CLIENT_AUTH=""
     CLIENT_PRIV=""; CLIENT_PUB=""; CLIENT_SECRET=""
     ACCOUNT_USER=""; ACCOUNT_PASS=""
     INBOUND_ID=""; WS_PATH=""; WS_HOST=""; SNI=""; LISTEN=""
-    SS_METHOD=""
     REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""; REALITY_SNI=""
     CHANNEL_SNI=""; CHANNEL_CERT_DIR=""; REUSE_CLIENT=""; EXISTING_CLIENT_ID=""; CLIENT_SELECT=""
 
     menu_protocol
-
-    # Метод Shadowsocks по умолчанию. Внимание: на ядре 26.7.28 (текущая
-    # сборка на серверах) SS-2022 (2022-blake3-*) принимает конфиг, но
-    # клиентские подключения не проходят аутентификацию — метод не рабочий.
-    # По умолчанию используем рабочий aes-256-gcm; 2022 оставляем на выбор.
-    [[ "$PROTOCOL" == "shadowsocks" ]] && {
-        ask "Метод Shadowsocks" "aes-256-gcm" SS_METHOD
-        case "$SS_METHOD" in
-            2022-*)
-                warn "SS-2022 (2022-blake3-*) может не работать на текущем ядре Xray"
-                warn "(клиенты не проходят аутентификацию). Рекомендуем aes-256-gcm."
-                ;;
-        esac
-        case "$SS_METHOD" in
-            aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;;
-            *) warn "Метод «$SS_METHOD» может не поддерживаться Xray; оставляем." ;;
-        esac
-    }
 
     # Протокол порта (UDP для hysteria/wireguard и транспорта kcp)
     case "$PROTOCOL" in
@@ -2755,7 +2829,13 @@ create_channel() {
         *) CHANNEL_PROTO="tcp" ;;
     esac
     [[ "$TRANSPORT" == "kcp" ]] && CHANNEL_PROTO="udp"
-    pick_port PORT "$CHANNEL_PROTO"
+    if [[ "$TRANSPORT" == "xhttp" ]]; then
+        # XHTTP в эталоне слушает на unix-сокете (port=0 в БД) — nginx
+        # grpc_pass grpc://unix:... проксирует на сокет.
+        PORT=0
+    else
+        pick_port PORT "$CHANNEL_PROTO"
+    fi
 
     # Remark и клиент
     local def_remark def_email def_subid
@@ -2839,6 +2919,21 @@ create_channel() {
     else
         make_client_data "$PROTOCOL" "$CLIENT_EMAIL" "$CLIENT_SUBID" "$CLIENT_FLOW"
     fi
+    # XTLS Vision совместим только с tcp+reality/tls. Для всех остальных
+    # комбинаций flow принудительно сбрасывается (иначе сервер молча рвёт
+    # соединение), в т.ч. при переиспользовании клиента с vision-инбаундом.
+    case "$TRANSPORT" in
+        ws|grpc|xhttp|httpupgrade)
+            [[ -n "$CLIENT_FLOW" ]] && info "flow сброшен для $TRANSPORT (Vision несовместим)."
+            CLIENT_FLOW=""
+            ;;
+        tcp)
+            if [[ "$SECURITY" != "reality" && "$SECURITY" != "tls" ]]; then
+                [[ -n "$CLIENT_FLOW" ]] && info "flow сброшен для tcp+$SECURITY (Vision только на tcp+reality/tls)."
+                CLIENT_FLOW=""
+            fi
+            ;;
+    esac
     if [[ "$PROTOCOL" == "http" || "$PROTOCOL" == "mixed" ]]; then
         CLIENT_JSON=""
     else
@@ -2847,7 +2942,18 @@ create_channel() {
 
     # Параметры пути и REALITY
     case "$TRANSPORT" in
-        ws|grpc|xhttp|httpupgrade)
+        xhttp)
+            # XHTTP идёт через unix-сокет (эталон): путь без порта, /x<hex>.
+            while true; do
+                ask "Путь XHTTP (nginx location, формат /x<name>)" "/x$(gen_hex 5)" WS_PATH
+                if db_path_in_use "$WS_PATH"; then
+                    warn "Путь $WS_PATH уже используется другим инбаундом за прокси."
+                    confirm "Продолжить с тем же путём?" || continue
+                fi
+                break
+            done
+            ;;
+        ws|grpc|httpupgrade)
             while true; do
                 ask "Путь (для nginx нужен формат /<порт>/<name>)" "/${PORT}/$(gen_hex 5)" WS_PATH
                 if db_path_in_use "$WS_PATH"; then
@@ -2892,15 +2998,23 @@ create_channel() {
         fi
     fi
     if [[ "$SECURITY" == "reality" ]]; then
-        # Поддомен REALITY запрашивается интерактивно (как и в x-ui-pro mozaroc):
-        # на него должна указывать A-запись, он служит SNI маскировки клиента и
-        # serverNames инбаунда. Хардкодом домены в скрипте не фиксируются.
+        # REALITY занимает ОСНОВНОЙ домен (например plesav.ru), а панель при
+        # этом живёт на поддомене (например p.plesav.ru). По умолчанию берём
+        # основной домен из домена панели, но SNI можно изменить интерактивно.
+        # На SNI должна указывать A-запись — он служит SNI маскировки клиента
+        # и serverNames инбаунда.
+        local base_domain=""
+        if [[ "$PANEL_HOST" == *.*.* ]]; then
+            base_domain="${PANEL_HOST#*.}"
+        elif [[ -n "$PANEL_HOST" ]]; then
+            base_domain="$PANEL_HOST"
+        fi
         while true; do
-            ask "Поддомен REALITY (SNI маскировки, A-запись → сервер, напр. v.example.com)" "" CHANNEL_SNI
-            [[ -n "$CHANNEL_SNI" ]] || { warn "Поддомен REALITY обязателен."; continue; }
+            ask "Домен REALITY (SNI маскировки, A-запись → сервер)" "$base_domain" CHANNEL_SNI
+            [[ -n "$CHANNEL_SNI" ]] || { warn "Домен REALITY обязателен."; continue; }
             if [[ -n "$PANEL_HOST" && "$CHANNEL_SNI" == "$PANEL_HOST" ]]; then
-                warn "SNI совпадает с доменом панели — REALITY не сможет маскироваться."
-                continue
+                warn "SNI совпадает с доменом панели: панель и REALITY будут конфликтовать на 443."
+                warn "Переведи панель на поддомен (напр. p.${base_domain:-<домен>}) или укажи другой SNI."
             fi
             if db_sni_in_use "$CHANNEL_SNI" reality; then
                 warn "SNI $CHANNEL_SNI уже используется другим REALITY-инбаундом."
@@ -2915,7 +3029,7 @@ create_channel() {
         REALITY_SPIDERX="/"
         gen_reality_keys
         REALITY_SETTINGS_JSON="$(reality_settings "$REALITY_TARGET" "$REALITY_SNI")"
-        info "REALITY: поддомен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
+        info "REALITY: домен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
     fi
 
     # nginx-интеграция: все проксируемые инбаунды ВСЕГДА за 443 (stream-мастер),
@@ -2947,6 +3061,28 @@ create_channel() {
     fi
 
     # Сборка JSON и вставка
+    if [[ "$TRANSPORT" == "xhttp" ]]; then
+        # XHTTP перенесён с эталона — работает ТОЛЬКО через nginx (unix-сокет)
+        if [[ -z "$USE_NGINX" ]]; then
+            warn "XHTTP требует nginx (unix-сокет /dev/shm/uds2023.sock + grpc_pass)."
+            warn "nginx не доступен — создание xhttp-инбаунда прервано."
+            return 0
+        fi
+        # Уникальность unix-сокета (эталон допускает один XHTTP на сокет)
+        if [[ -n "$(sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE listen LIKE '/dev/shm/uds2023.sock%';" 2>/dev/null || true)" ]]; then
+            warn "XHTTP-инбаунд на unix-сокете /dev/shm/uds2023.sock уже существует —"
+            warn "эталон поддерживает один XHTTP на сокет. Пересоздание невозможно."
+            return 0
+        fi
+        LISTEN="/dev/shm/uds2023.sock,0666"
+        info "XHTTP будет слушать на unix-сокете ${LISTEN} (nginx grpc_pass)."
+    fi
+    # host/authority для http-транспортов за nginx — домен (как в эталоне);
+    # для XHTTP host остаётся пустым (в эталоне host="").
+    if [[ -n "$USE_NGINX" && "$TRANSPORT" == "ws" || -n "$USE_NGINX" && "$TRANSPORT" == "grpc" || -n "$USE_NGINX" && "$TRANSPORT" == "httpupgrade" ]]; then
+        WS_HOST="${PANEL_HOST:-$(external_addr)}"
+        info "host/authority инбаунда: ${WS_HOST}"
+    fi
     if [[ "$SECURITY" == "reality" ]]; then
         # Target — сайт-прикрытие: за nginx это локальная заглушка 127.0.0.1:9443
         # (nginx http-сервер с сертификатом поддомена REALITY), как в эталоне
@@ -2960,7 +3096,7 @@ create_channel() {
         info "REALITY target: $REALITY_TARGET"
     fi
     local settings_json stream_json snf_json
-    settings_json="$(build_settings "$PROTOCOL" "$CLIENT_JSON" "$SS_METHOD")"
+    settings_json="$(build_settings "$PROTOCOL" "$CLIENT_JSON")"
     if [[ -n "$USE_NGINX" && "$TRANSPORT" != "tcp" ]]; then
         # Инбаунд за nginx (ws/grpc/xhttp/httpupgrade): TLS терминируется на
         # nginx, поэтому xray слушает на 127.0.0.1:PORT БЕЗ TLS.
@@ -2987,7 +3123,11 @@ create_channel() {
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
         case "$TRANSPORT" in
-            ws|grpc|xhttp|httpupgrade)
+            xhttp)
+                nginx_add_xhttp_location
+                nginx_ensure_snippet_included
+                ;;
+            ws|grpc|httpupgrade)
                 nginx_add_http_location
                 nginx_ensure_snippet_included
                 ;;
@@ -3037,7 +3177,24 @@ main() {
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
         # «Всё через 443» включается автоматически: stream-мастер на 443,
         # все инбаунды и панель выходят наружу через единый 443.
-        if ! is_stream_443_master; then
+        if is_stream_443_master; then
+            # Пересобираем stream.conf из БД: держим proxy_protocol и SNI-map
+            # актуальными (старые конфиги без proxy_protocol ломают инбаунды
+            # с acceptProxyProtocol=true).
+            nginx_stream_master_rebuild || warn "Не удалось пересобрать stream-мастер."
+            # Конфиг панели тоже должен принимать PROXY-заголовок мастера:
+            # без listen ... proxy_protocol все запросы через 443 (WS/gRPC/XHTTP
+            # и сама панель) молча падают.
+            local pconf="$NGINX_CONF"
+            if [[ -z "$pconf" || ! -f "$pconf" ]]; then
+                detect_nginx_conf
+                pconf="$NGINX_CONF"
+            fi
+            [[ -z "$pconf" || ! -f "$pconf" ]] && pconf="/etc/nginx/conf.d/x-ui.conf"
+            local pmode="panel"
+            [[ -n "$ENABLE_LANDING" ]] && pmode="landing"
+            write_panel_conf "$pconf" "$pmode" || warn "Не удалось обновить конфиг панели (proxy_protocol)."
+        else
             nginx_stream_master_setup auto
         fi
     fi
