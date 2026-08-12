@@ -409,6 +409,16 @@ external_addr() {
     if [[ -n "$PANEL_HOST" ]]; then printf '%s' "$PANEL_HOST"; else printf '%s' "$SERVER_IP"; fi
 }
 
+# domain_root <домен> — корневой домен без поддомена (p.plesav.ru → plesav.ru).
+domain_root() {
+    local h="${1:-}"
+    if [[ "$h" == *.*.* ]]; then
+        printf '%s' "${h#*.}"
+    else
+        printf '%s' "$h"
+    fi
+}
+
 load_panel_env() {
     require_panel
     detect_panel_cert
@@ -2098,10 +2108,24 @@ server {
 "
         fi
     fi
+    # Корневой домен (заглушка) → тоже на http-модуль nginx, чтобы не уходил
+    # в default (REALITY) и получал свой сертификат в отдельном server-блоке.
+    local root_line=""
+    local root_dom=""
+    root_dom="$(domain_root "$PANEL_HOST")"
+    if [[ -n "$root_dom" && "$root_dom" != "$PANEL_HOST" && -n "$PANEL_SSL_PORT" \
+        && -f "/etc/letsencrypt/live/${root_dom}/fullchain.pem" ]]; then
+        local root_esc
+        root_esc="$(printf '%s' "$root_dom" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+        if ! printf '%s' "$map_lines" | grep -Eq "^    ${root_esc}[[:space:]]+127\.0\.0\.1:${PANEL_SSL_PORT};$"; then
+            root_line="    ${root_dom}  127.0.0.1:${PANEL_SSL_PORT};
+"
+        fi
+    fi
     cat > "$tmp" <<EOF
 # inbound-xray.sh: stream-443 master (все внешние TLS-потоки идут на ${STREAM_MASTER_PORT:-443})
 map \$ssl_preread_server_name \$xui_backend {
-${map_lines}${panel_line}    default  127.0.0.1:${real_def};
+${map_lines}${panel_line}${root_line}    default  127.0.0.1:${real_def};
 }
 
 server {
@@ -2692,6 +2716,27 @@ ${up_extra}
     # WS/gRPC regex-location'ы живут в общем сниппете — подключаем его в server
     nginx_ensure_files
     local snippet_line="    include ${NGINX_SNIPPET};"
+    # Второй server-блок для корневого домена (заглушка со своим сертификатом):
+    # при панели на поддомене (p.plesav.ru) корень (plesav.ru) тоже должен
+    # отвечать правильно, иначе браузер видит чужой сертификат (name error).
+    # Включается только в режиме stream-мастера, где оба домена слушает nginx.
+    local extra_block=""
+    local root_dom=""
+    root_dom="$(domain_root "$PANEL_HOST")"
+    if [[ "$STREAM_443_MASTER" == "1" && -n "$root_dom" && "$root_dom" != "$PANEL_HOST" \
+        && -f "/etc/letsencrypt/live/${root_dom}/fullchain.pem" ]]; then
+        extra_block="
+server {
+${listen_dir}
+    ssl_certificate     /etc/letsencrypt/live/${root_dom}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${root_dom}/privkey.pem;
+    server_name ${root_dom};
+${snippet_line}
+
+${root_loc}
+}
+"
+    fi
     cat > "$file" <<EOF
 server {
 ${listen_dir}
@@ -2701,6 +2746,7 @@ ${snippet_line}
 
 ${panel_loc}${sub_loc}${root_loc}
 }
+${extra_block}
 EOF
     if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
         warn "nginx -t не прошёл — откат конфигурации."
@@ -2757,8 +2803,10 @@ setup_landing() {
     fi
 
     # Название сайта и конфиг
-    local site_title=""
-    ask "Название сайта для заглушки" "$(external_addr)" site_title
+    local site_default="" site_title=""
+    site_default="$(domain_root "$PANEL_HOST")"
+    [[ -n "$site_default" ]] || site_default="$(external_addr)"
+    ask "Название сайта для заглушки" "$site_default" site_title
     gen_landing_html "$site_title"
 
     local conf="$NGINX_CONF"
