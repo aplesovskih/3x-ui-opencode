@@ -40,6 +40,7 @@ XUI_BIN="/usr/local/x-ui/x-ui"
 PANEL_INSTALL_LOG="/var/log/3x-ui-install.log"   # лог официального установщика
 NGINX_SNIPPET="/etc/nginx/snippets/includes.conf"
 NGINX_STREAM="/etc/nginx/stream-enabled/stream.conf"
+PANEL_STATE="/etc/nginx/inbound-xray.state"
 NGINX_CONF="/etc/nginx/conf.d/x-ui.conf"
 NGINX_MAIN="/etc/nginx/nginx.conf"
 # 1 = всё внешнее трафик (http + stream) уже переведено на единый 443
@@ -253,20 +254,44 @@ require_panel() {
 
 # --- Определение окружения панели -------------------------------------------------
 
+# panel_domain_from_cert <fullchain> — домен из SAN сертификата (fallback — имя каталога).
+panel_domain_from_cert() {
+    local cert="$1" san=""
+    san="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null || true)"
+    if [[ "$san" =~ DNS:([^,]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '%s' "$(basename "$(dirname "$cert")")"
+    fi
+}
+
+# save_panel_state — запоминает выбранный домен/каталог панели в файл состояния,
+# чтобы перезапуски скрипта не теряли его при нескольких сертификатах на сервере.
+save_panel_state() {
+    [[ -z "$PANEL_HOST" ]] && return 0
+    mkdir -p "$(dirname "$PANEL_STATE")" 2>/dev/null || return 0
+    cat > "$PANEL_STATE" <<EOF
+PANEL_HOST="$PANEL_HOST"
+PANEL_CERT_DIR="$PANEL_CERT_DIR"
+EOF
+    chmod 600 "$PANEL_STATE" 2>/dev/null || true
+}
+
 # detect_panel_cert — ищет сертификат панели. Источники по приоритету:
 #  1. /root/cert/ip            — IP-сертификат (панель по IP, PANEL_HOST пустой);
-#  2. /root/cert/<домен>       — доменные каталоги;
-#  3. /etc/letsencrypt/live/*  — сертификаты Let's Encrypt (certbot).
+#  2. server_name из конфига панели (реальный домен, не "_") + LE live/<домен>;
+#  3. ssl_certificate из конфига панели, если путь ведёт в /etc/letsencrypt/live/;
+#  4. файл состояния (PANEL_STATE) — домен, выбранный ранее;
+#  5. обход /etc/letsencrypt/live/* (один каталог → он; несколько → вопрос);
+#     без LE — обход доменных каталогов /root/cert/* (кроме "ip").
+# Доменные каталоги /root/cert/<домен> НЕ выбираются, если есть LE live:
+# они могут содержать сертификаты других сайтов (например основного домена).
 # Устанавливает PANEL_CERT, PANEL_CERT_KEY, PANEL_CERT_DIR и PANEL_HOST (домен из SAN).
 detect_panel_cert() {
     PANEL_CERT=""; PANEL_CERT_KEY=""; PANEL_CERT_DIR=""; PANEL_HOST=""
     local base="/root/cert"
-    local dirs=()
-    [[ -d "$base" ]] && dirs+=("$base")
-    [[ -d /etc/letsencrypt/live ]] && dirs+=(/etc/letsencrypt/live)
-    ((${#dirs[@]} == 0)) && return 0
 
-    # Приоритет: каталог по IP, затем доменные каталоги
+    # 1. IP-сертификат: панель по IP, домена нет
     local ip_cert="$base/ip"
     if [[ -f "$ip_cert/fullchain.pem" && -f "$ip_cert/privkey.pem" ]]; then
         PANEL_CERT="$ip_cert/fullchain.pem"
@@ -275,45 +300,97 @@ detect_panel_cert() {
         return 0
     fi
 
-    # Приоритет: домен панели из nginx-конфига (server_name ssl-сервера панели).
-    # На него указывает A-запись, он уже терминирует TLS — это и есть панель.
     local pconf="${NGINX_CONF:-/etc/nginx/conf.d/x-ui.conf}"
+    local live_dir="/etc/letsencrypt/live"
+
+    # 2. Панель из server_name конфига: реальный домен + сертификат в LE live
     if [[ -f "$pconf" ]]; then
         local sname=""
         sname="$(sed -n 's/.*server_name[[:space:]]*\([^;]*\);.*/\1/p' "$pconf" | tr -d ' ' | head -1 || true)"
         local sname_first="${sname%% *}"
-        if [[ -n "$sname_first" && -f "/etc/letsencrypt/live/${sname_first}/fullchain.pem" ]]; then
-            PANEL_CERT="/etc/letsencrypt/live/${sname_first}/fullchain.pem"
-            PANEL_CERT_KEY="/etc/letsencrypt/live/${sname_first}/privkey.pem"
-            PANEL_CERT_DIR="/etc/letsencrypt/live/${sname_first}"
+        if [[ -n "$sname_first" && "$sname_first" != "_" && -f "$live_dir/${sname_first}/fullchain.pem" ]]; then
+            PANEL_CERT="$live_dir/${sname_first}/fullchain.pem"
+            PANEL_CERT_KEY="$live_dir/${sname_first}/privkey.pem"
+            PANEL_CERT_DIR="$live_dir/${sname_first}"
             PANEL_HOST="$sname_first"
+            save_panel_state
+            return 0
+        fi
+
+        # 3. Панель из ssl_certificate конфига (путь → LE live/<домен>)
+        local scrt=""
+        scrt="$(sed -n 's/.*ssl_certificate[[:space:]]*\([^;]*\);.*/\1/p' "$pconf" | tr -d ' ' | head -1 || true)"
+        if [[ "$scrt" =~ ^/etc/letsencrypt/live/([^/]+)/ ]]; then
+            local sn="${BASH_REMATCH[1]}"
+            if [[ -n "$sn" && -f "$live_dir/${sn}/fullchain.pem" ]]; then
+                PANEL_CERT="$live_dir/${sn}/fullchain.pem"
+                PANEL_CERT_KEY="$live_dir/${sn}/privkey.pem"
+                PANEL_CERT_DIR="$live_dir/${sn}"
+                PANEL_HOST="$sn"
+                save_panel_state
+                return 0
+            fi
+        fi
+    fi
+
+    # 4. Файл состояния: ранее выбранный домен панели
+    if [[ -f "$PANEL_STATE" ]]; then
+        local st_host=""
+        st_host="$(sed -n 's/^PANEL_HOST="\([^"]*\)"/\1/p' "$PANEL_STATE" | head -1 || true)"
+        if [[ -n "$st_host" && -f "$live_dir/${st_host}/fullchain.pem" ]]; then
+            PANEL_CERT="$live_dir/${st_host}/fullchain.pem"
+            PANEL_CERT_KEY="$live_dir/${st_host}/privkey.pem"
+            PANEL_CERT_DIR="$live_dir/${st_host}"
+            PANEL_HOST="$st_host"
             return 0
         fi
     fi
 
-    local d crt key
-    for d in "${dirs[@]}"; do
-        local sub
-        for sub in "$d"/*/; do
+    # 5. Обход каталогов с сертификатами
+    local pick_dir=""
+    local pick_dirs=()
+    local crt key sub
+    for sub in "$live_dir"/*/; do
+        [[ -d "$sub" ]] || continue
+        crt="$sub/fullchain.pem"; key="$sub/privkey.pem"
+        [[ -f "$crt" && -f "$key" ]] || continue
+        pick_dirs+=("$sub")
+    done
+    # Без LE — доменные каталоги /root/cert (панель могла быть настроена вручную)
+    if ((${#pick_dirs[@]} == 0)); then
+        for sub in "$base"/*/; do
             [[ -d "$sub" ]] || continue
+            [[ "$(basename "$sub")" == "ip" ]] && continue
             crt="$sub/fullchain.pem"; key="$sub/privkey.pem"
             [[ -f "$crt" && -f "$key" ]] || continue
-            PANEL_CERT="$crt"; PANEL_CERT_KEY="$key"; PANEL_CERT_DIR="${sub%/}"
-            break 2
+            pick_dirs+=("$sub")
         done
-    done
-    [[ -n "$PANEL_CERT" ]] || return 0
-
-    # Домен из SAN сертификата (fallback — имя каталога)
-    local san=""
-    san=$(openssl x509 -in "$PANEL_CERT" -noout -ext subjectAltName 2>/dev/null || true)
-    if [[ "$san" =~ DNS:([^,]+) ]]; then
-        PANEL_HOST="${BASH_REMATCH[1]}"
-    else
-        PANEL_HOST="$(basename "$PANEL_CERT_DIR")"
-        # Если каталог называется "ip" — это IP-сертификат, домена нет
-        [[ "$PANEL_HOST" == "ip" ]] && PANEL_HOST=""
     fi
+    if ((${#pick_dirs[@]} == 0)); then
+        return 0   # сертификата панели нет — панель доступна по IP/HTTP
+    fi
+    pick_dir="${pick_dirs[0]}"
+    if ((${#pick_dirs[@]} > 1)); then
+        local i dom pick="" def_idx=1
+        info "Найдено несколько сертификатов — укажите, какой из них для панели."
+        for i in "${!pick_dirs[@]}"; do
+            dom="$(panel_domain_from_cert "${pick_dirs[$i]}/fullchain.pem")"
+            printf '  %d) %s\n' "$((i+1))" "$dom"
+        done
+        ask "Номер сертификата панели" "$def_idx" pick
+        pick="${pick:-$def_idx}"
+        if [[ "$pick" =~ ^[0-9]+$ ]] && ((pick >= 1 && pick <= ${#pick_dirs[@]})); then
+            pick_dir="${pick_dirs[$((pick-1))]}"
+        else
+            warn "Неверный номер — беру первый."
+        fi
+    fi
+    PANEL_CERT="$pick_dir/fullchain.pem"
+    PANEL_CERT_KEY="$pick_dir/privkey.pem"
+    PANEL_CERT_DIR="${pick_dir%/}"
+    PANEL_HOST="$(panel_domain_from_cert "$PANEL_CERT")"
+    [[ "$PANEL_HOST" == "ip" ]] && PANEL_HOST=""
+    save_panel_state
 }
 
 # detect_server_ip — внешний IP-адрес сервера.
@@ -2533,6 +2610,11 @@ write_panel_conf() {
         proxy_ssl_server_name off;"
     fi
 
+    # server_name панели — реальный домен (не "_"), чтобы повторный запуск
+    # скрипта находил панель по нему, а не по случайному каталогу сертификата.
+    local sname="_"
+    [[ -n "$PANEL_HOST" ]] && sname="$PANEL_HOST"
+
     local sub_loc=""
     if [[ "$SUB_ENABLE" == "true" && -n "$SUB_PORT" ]]; then
         local sub_loc_path="${SUB_PATH:-/sub/}"
@@ -2555,7 +2637,9 @@ write_panel_conf() {
     fi
 
     local panel_loc=""
-    if [[ "$mode" == "landing" && -n "$PANEL_PATH" ]]; then
+    # Панель на скрытом пути — в любом режиме (landing и panel) не переезжает
+    # на корень: включение/выключение заглушки не меняет адрес панели.
+    if [[ -n "$PANEL_PATH" && "$PANEL_PATH" != "/" && "$PANEL_PATH" != "./" ]]; then
         panel_loc="    location ${PANEL_PATH} {
         proxy_pass ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT};
 ${up_extra}
@@ -2574,7 +2658,13 @@ ${up_extra}
     fi
 
     local root_loc=""
-    if [[ "$mode" == "landing" ]]; then
+    if [[ -n "$panel_loc" ]]; then
+        # Панель на скрытом пути → корень всегда заглушка (адрес панели фиксирован)
+        root_loc="    location / {
+        root ${LANDING_DIR};
+        index index.html;
+    }"
+    elif [[ "$mode" == "landing" ]]; then
         root_loc="    location / {
         root ${LANDING_DIR};
         index index.html;
@@ -2606,7 +2696,7 @@ ${up_extra}
 server {
 ${listen_dir}
 ${ssl_lines}
-    server_name _;
+    server_name ${sname};
 ${snippet_line}
 
 ${panel_loc}${sub_loc}${root_loc}
@@ -2684,10 +2774,10 @@ setup_landing() {
     print_panel_data
 }
 
-# disable_landing — возвращает панель на корневой адрес.
-# Путь панели (webBasePath) при этом НЕ меняется — адрес панели остаётся
-# скрытым (раньше set_panel_base_path "" возвращал панель на корень, из-за
-# чего при повторном включении заглушки снова спрашивался путь панели).
+# disable_landing — выключает заглушку на корне.
+# Адрес панели при этом НЕ меняется: если у панели скрытый путь (webBasePath),
+# она остаётся на /<путь>/, а корень — заглушка (панель никогда не переезжает
+# на корень; раньше panel-режим писал location / → панель, теряя путь).
 disable_landing() {
     local conf="$NGINX_CONF"
     if [[ -z "$conf" || ! -f "$conf" ]]; then
