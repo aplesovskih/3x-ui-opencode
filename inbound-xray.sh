@@ -419,6 +419,32 @@ domain_root() {
     fi
 }
 
+# detect_panel_proto <port> — фактический протокол панели 3x-ui (http/https).
+# x-ui выводит «Panel is secure with SSL», даже когда webCertFile/webKeyFile
+# заданы, но файлов на диске нет и панель реально слушает HTTP — доверять этой
+# строке нельзя (nginx шлёт TLS в HTTP-порт → панель отдаёт 502). https считаем
+# только если оба файла сертификата существуют И панель отвечает на https-пробу.
+# Печатает "http" или "https".
+detect_panel_proto() {
+    local port="${1:-}" web_cert="" web_key="" probe=""
+    if [[ -z "$port" ]]; then
+        printf 'http'
+        return 0
+    fi
+    web_cert="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webCertFile' LIMIT 1;" 2>/dev/null || true)"
+    web_key="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webKeyFile' LIMIT 1;" 2>/dev/null || true)"
+    if [[ -n "$web_cert" && -n "$web_key" && -f "$web_cert" && -f "$web_key" ]]; then
+        if command -v curl >/dev/null 2>&1; then
+            probe="$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${port}/" 2>/dev/null || true)"
+            [[ -n "$probe" && "$probe" != "000" ]] && { printf 'https'; return 0; }
+        else
+            printf 'https'
+            return 0
+        fi
+    fi
+    printf 'http'
+}
+
 load_panel_env() {
     require_panel
     detect_panel_cert
@@ -430,9 +456,6 @@ load_panel_env() {
     local show=""
     if [[ -x "$XUI_BIN" ]]; then
         show="$("$XUI_BIN" setting -show true 2>/dev/null || true)"
-        if [[ "$show" =~ Panel[[:space:]]is[[:space:]]secure[[:space:]]with[[:space:]]SSL ]]; then
-            PANEL_PROTO="https"
-        fi
         if [[ "$show" =~ port:[[:space:]]*([0-9]+) ]]; then
             PANEL_PORT="${BASH_REMATCH[1]}"
         fi
@@ -446,6 +469,10 @@ load_panel_env() {
         PANEL_PORT="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)"
     fi
     [[ -n "$PANEL_PORT" ]] || die "Не удалось определить порт панели 3x-ui."
+
+    # Протокол панели — по факту (файлы серта + https-проба), а не по строке
+    # «Panel is secure with SSL»: см. detect_panel_proto.
+    PANEL_PROTO="$(detect_panel_proto "$PANEL_PORT")"
 
     # Учётные данные — из лога официального установщика (fallback: не критично)
     if [[ -s "$PANEL_INSTALL_LOG" ]]; then
@@ -1008,6 +1035,14 @@ ensure_channel_cert() {
         CHANNEL_CERT_DIR="$dir"
         return 0
     fi
+    # Уже выпущенный Let's Encrypt сертификат домена (например, REALITY на
+    # основном домене): используем его вместо выдачи нового или self-signed.
+    if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" \
+        && -f "/etc/letsencrypt/live/${domain}/privkey.pem" ]]; then
+        ok "Используем существующий Let's Encrypt сертификат: /etc/letsencrypt/live/${domain}"
+        CHANNEL_CERT_DIR="/etc/letsencrypt/live/${domain}"
+        return 0
+    fi
     CHANNEL_CERT_DIR="$dir"
     if confirm "Выпустить сертификат для $domain (Let's Encrypt, нужна DNS-запись)?" "y"; then
         issue_domain_cert "$domain" \
@@ -1386,6 +1421,39 @@ restart_xui() {
     else
         warn "systemctl/x-ui недоступны — примените конфигурацию вручную (перезапуск x-ui)."
     fi
+}
+
+# sync_panel_webcert — приводит webCertFile/webKeyFile панели к фактическому
+# сертификату панели (PANEL_CERT/PANEL_CERT_KEY), если они расходятся.
+# Мёртвые пути (файлов нет на диске) заставляют панель отвечать по HTTP, хотя
+# она выводит «Panel is secure with SSL»: nginx шлёт TLS в HTTP-порт → 502.
+# Кроме того, меню установщика x-ui (check_config) берёт домен из имени
+# каталога webCertFile — отсюда «адрес панели на основном домене». Если
+# PANEL_CERT не найден — пути очищаются (панель честно работает по HTTP).
+# subCertFile/subKeyFile не трогаются: подписка отдаётся через nginx по HTTP.
+sync_panel_webcert() {
+    [[ -x "$XUI_BIN" ]] || return 0
+    [[ -n "$XUI_DB" && -f "$XUI_DB" ]] || return 0
+    local cur_cert="" cur_key="" want_cert="" want_key=""
+    cur_cert="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webCertFile' LIMIT 1;" 2>/dev/null || true)"
+    cur_key="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webKeyFile' LIMIT 1;" 2>/dev/null || true)"
+    if [[ -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" && -f "$PANEL_CERT" && -f "$PANEL_CERT_KEY" ]]; then
+        want_cert="$PANEL_CERT"
+        want_key="$PANEL_CERT_KEY"
+    fi
+    if [[ "$cur_cert" == "$want_cert" && "$cur_key" == "$want_key" ]]; then
+        return 0
+    fi
+    warn "Настройки сертификата панели расходятся с найденным сертификатом:"
+    warn "  webCertFile: ${cur_cert:-<пусто>} → ${want_cert:-<пусто>}"
+    warn "  webKeyFile:  ${cur_key:-<пусто>} → ${want_key:-<пусто>}"
+    confirm "Применить и перезапустить панель x-ui?" || return 0
+    sqlite3 "$XUI_DB" "UPDATE settings SET value='$(sql_escape "$want_cert")' WHERE key='webCertFile';" \
+        || warn "Не удалось обновить webCertFile."
+    sqlite3 "$XUI_DB" "UPDATE settings SET value='$(sql_escape "$want_key")' WHERE key='webKeyFile';" \
+        || warn "Не удалось обновить webKeyFile."
+    restart_xui
+    info "Сертификат панели применён: ${want_cert:-<очищено>}"
 }
 
 # =============================================================================
@@ -1813,8 +1881,8 @@ nginx_add_xhttp_location() {
     [[ -f "$NGINX_SNIPPET" ]] || return 0
     local path="${XHTTP_PATH:-$WS_PATH}"
     [[ -n "$path" ]] || return 0
-    if grep -Fqs "grpc_pass grpc://unix:/dev/shm/uds2023.sock;" "$NGINX_SNIPPET"; then
-        info "XHTTP location (grpc_pass unix-сокет) уже настроена."
+    if grep -Fqs "location ${path} {" "$NGINX_SNIPPET"; then
+        info "XHTTP location ${path} уже настроена."
         return 0
     fi
     local block
@@ -3156,7 +3224,11 @@ create_channel() {
             local prefix="" def_sni=""
             case "$PROTOCOL" in vless) prefix="v";; vmess) prefix="m";; trojan) prefix="t";; *) prefix="x";; esac
             if [[ -n "$PANEL_HOST" ]]; then
-                def_sni="${prefix}.${PANEL_HOST}"
+                if [[ "$PANEL_HOST" == *.*.* ]]; then
+                    def_sni="${prefix}.${PANEL_HOST#*.}"
+                else
+                    def_sni="${prefix}.${PANEL_HOST}"
+                fi
                 warn "Для TCP+TLS инбаунда нужен уникальный домен (SNI)."
                 warn "Добавь у регистратора запись A: $def_sni → $SERVER_IP (или CNAME на $PANEL_HOST)."
             else
@@ -3358,6 +3430,7 @@ main() {
     detect_os
     require_tools
     load_panel_env
+    sync_panel_webcert
     if command -v nginx >/dev/null 2>&1; then
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
         nginx_stream_context_enable || warn "Не удалось подключить stream-контекст."
