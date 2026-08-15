@@ -821,22 +821,25 @@ build_settings() {
 
 # --- Сборка stream_settings ---------------------------------------------------------
 
-# tls_settings <serverName> — JSON tlsSettings. Для инбаунда с уникальным SNI
+# tls_settings <serverName> [alpn] — JSON tlsSettings. Для инбаунда с уникальным SNI
 # (TCP+TLS) используется его собственный сертификат из CHANNEL_CERT_DIR,
 # иначе — сертификат панели; при отсутствии — self-signed.
+# alpn передаётся готовым JSON-списком; по умолчанию ["h2","http/1.1"],
+# для hysteria нужен ["h3"] (QUIC/HTTP3).
 tls_settings() {
     local sni="${1:-}"
+    local alpn="${2:-\"h2\", \"http/1.1\"}"
     local cert="$PANEL_CERT" key="$PANEL_CERT_KEY"
     if [[ -n "${CHANNEL_CERT_DIR:-}" ]]; then
         cert="$CHANNEL_CERT_DIR/fullchain.pem"
         key="$CHANNEL_CERT_DIR/privkey.pem"
     fi
     if [[ -n "$cert" && -n "$key" ]]; then
-        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$cert" "$key"
+        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": [%s],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$cert" "$key" "$alpn"
     else
         printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "Сертификат не найден — будет выпущен self-signed для инбаунда." >&2
         gen_selfsigned_inbound_cert
-        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": ["h2", "http/1.1"],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$PANEL_CERT" "$PANEL_CERT_KEY"
+        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": [%s],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$PANEL_CERT" "$PANEL_CERT_KEY" "$alpn"
     fi
 }
 
@@ -860,6 +863,17 @@ gen_selfsigned_inbound_cert() {
     fi
     PANEL_CERT="$dir/fullchain.pem"
     PANEL_CERT_KEY="$dir/privkey.pem"
+}
+
+
+# xray_version — версия Xray-ядра панели (для диагностики XHTTP: клиент и
+# сервер должны быть одной версии).
+xray_version() {
+    local out
+    if [[ -x "$XUI_XRAY" ]]; then
+        out="$("$XUI_XRAY" version 2>/dev/null | head -1)"
+        [[ -n "$out" ]] && printf '%s' "$out"
+    fi
 }
 
 
@@ -897,11 +911,20 @@ build_stream() {
     case "$network" in
         xhttp)
             # XHTTP+REALITY: инбаунд слушает прямой TCP-порт (nginx не участвует),
-            # serverNames приходят из REALITY_SETTINGS_JSON.
-            printf '{\n  "network": "xhttp",\n  "xhttpSettings": {\n    "path": "%s",\n    "host": "%s",\n    "headers": {}\n  },\n  "sockopt": {\n    "acceptProxyProtocol": false,\n    "tcpFastOpen": true,\n    "tcpMptcp": true,\n    "tcpNoDelay": true,\n    "domainStrategy": "UseIP",\n    "tcpMaxSeg": 1440,\n    "tcpcongestion": "bbr"\n  },\n  "security": "reality",\n  "realitySettings": %s\n}' "$path" "$host" "$REALITY_SETTINGS_JSON"
+            # serverNames приходят из REALITY_SETTINGS_JSON. При включённом
+            # stream-мастере инбаунд сидит на 127.0.0.1 за nginx и обязан
+            # принимать PROXY-заголовок (acceptProxyProtocol=true).
+            if [[ "$STREAM_443_MASTER" == "1" ]]; then
+                local pp="true"
+            else
+                local pp="false"
+            fi
+            printf '{\n  "network": "xhttp",\n  "xhttpSettings": {\n    "path": "%s",\n    "host": "%s",\n    "headers": {}\n  },\n  "sockopt": {\n    "acceptProxyProtocol": %s,\n    "tcpFastOpen": true,\n    "tcpMptcp": true,\n    "tcpNoDelay": true,\n    "domainStrategy": "UseIP",\n    "tcpMaxSeg": 1440,\n    "tcpcongestion": "bbr"\n  },\n  "security": "reality",\n  "realitySettings": %s\n}' "$path" "$host" "$pp" "$REALITY_SETTINGS_JSON"
             ;;
         hysteria)
-            printf '{\n  "network": "hysteria",\n  "hysteriaSettings": {\n    "version": 2,\n    "udpIdleTimeout": 60\n  },\n  "security": "tls",\n  "tlsSettings": %s\n}' "$(tls_settings "$sni")"
+            # Для QUIC/HTTP3 обязателен alpn=["h3"], иначе клиент (v2rayNG с
+            # alpn=h3) не договаривается с сервером на TLS-слое.
+            printf '{\n  "network": "hysteria",\n  "hysteriaSettings": {\n    "version": 2,\n    "udpIdleTimeout": 60\n  },\n  "security": "tls",\n  "tlsSettings": %s\n}' "$(tls_settings "$sni" '"h3"')"
             ;;
         *)
             die "Неизвестный транспорт: $network"
@@ -993,6 +1016,12 @@ db_insert_inbound() {
         time_cols=", created_at, updated_at"
         time_vals=", $now, $now"
     fi
+    local share_addr
+    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$REALITY_SNI" ]]; then
+        share_addr="$REALITY_SNI"
+    else
+        share_addr="$(external_addr)"
+    fi
     INBOUND_ID="$(sqlite3 "$XUI_DB" "
 INSERT INTO inbounds
   (user_id, up, down, total, remark, enable, expiry_time, traffic_reset,
@@ -1002,7 +1031,7 @@ INSERT INTO inbounds
 VALUES
   (1, 0, 0, 0, '$(sql_escape "$REMARK")', 1, 0, 'never',
    0, '$(sql_escape "$LISTEN")', $PORT, '$PROTOCOL', '$(sql_escape "$settings")', '$(sql_escape "$stream")',
-   '$(sql_escape "$tag")', '$(sql_escape "$snf")', 1, NULL, 'custom', '$(sql_escape "$(external_addr)")',
+   '$(sql_escape "$tag")', '$(sql_escape "$snf")', 1, NULL, 'custom', '$(sql_escape "$share_addr")',
    '', 1${time_vals});
 SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в базу."
 }
@@ -1217,8 +1246,14 @@ json_extract() {
 
 # gen_link_vless — vless:// ссылка.
 # link_external — адрес:порт для share-ссылки. Инбаунды (xhttp+reality, hysteria)
-# слушают прямые порты (без прокси) — внешний адрес:PORT.
+# слушают прямые порты (без прокси) — внешний адрес:PORT. За stream-мастером
+# наружу смотрит только 443: внешний адрес xhttp+reality = домен REALITY
+# (SNI маскировки), порт 443 (nginx маршрутизирует по SNI).
 link_external() {
+    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$REALITY_SNI" ]]; then
+        printf '%s:%s' "$REALITY_SNI" "${STREAM_MASTER_PORT:-443}"
+        return 0
+    fi
     printf '%s:%s' "$(external_addr)" "$PORT"
 }
 
@@ -1255,6 +1290,9 @@ gen_link_hysteria2() {
     link="hysteria2://$(urlencode "$CLIENT_AUTH")@${addr}:${PORT}"
     local q=("security=tls")
     [[ -n "${SNI:-}" ]] && q+=("sni=${SNI}")
+    # Сертификат по IP (панель по IP, PANEL_HOST пуст) обычно самоподписанный —
+    # клиент не сможет его проверить: нужен insecure=1.
+    [[ -z "$PANEL_HOST" ]] && q+=("insecure=1")
     q+=("alpn=h3" "fp=chrome")
     printf '%s?%s#%s\n' "$link" "$(join_q "${q[@]}")" "$(urlencode "$REMARK")"
 }
@@ -1412,8 +1450,9 @@ nginx_stream_master_rebuild() {
         port="${row%%|*}"; row="${row#*|}"
         listen="${row%%|*}"; ss="${row#*|}"
         [[ "$listen" != "127.0.0.1" ]] && continue
-        # Только TCP (REALITY/TLS+TCP); WS/gRPC идут через http-модуль
-        printf '%s' "$ss" | grep -q '"network"[[:space:]]*:[[:space:]]*"tcp"' || continue
+        # Только TCP/XHTTP с SNI (REALITY/TLS); WS/gRPC идут через http-модуль.
+        # xhttp+reality за мастером тоже получает строку в map по своему SNI.
+        printf '%s' "$ss" | grep -qE '"network"[[:space:]]*:[[:space:]]*"(tcp|xhttp)"' || continue
         sni=""
         if printf '%s' "$ss" | grep -q '"realitySettings"'; then
             sni="$(printf '%s' "$ss" | sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
@@ -1527,7 +1566,7 @@ stream_master_apply_proxy_protocol() {
     while IFS= read -r row; do
         [[ -z "$row" ]] && continue
         id="${row%%|*}"; ss="${row#*|}"
-        printf '%s' "$ss" | grep -q '"network"[[:space:]]*:[[:space:]]*"tcp"' || continue
+        printf '%s' "$ss" | grep -qE '"network"[[:space:]]*:[[:space:]]*"(tcp|xhttp)"' || continue
         printf '%s' "$ss" | grep -qE '"security"[[:space:]]*:[[:space:]]*"(reality|tls)"' || continue
         sni="$(printf '%s' "$ss" | sed -nE 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
         if [[ -z "$sni" ]]; then
@@ -1836,7 +1875,11 @@ print_summary() {
     banner "  ========== Итоги: инбаунд «${REMARK}» =========="
     banner "  Метка: $(channel_name_label "$PROTOCOL" "$TRANSPORT" "$SECURITY" "$PORT")"
     banner "  Протокол: ${PROTOCOL}  Транспорт: ${TRANSPORT}  Безопасность: ${SECURITY}"
-    banner "  Порт: ${PORT}   Слушает: ${LISTEN:-0.0.0.0}"
+    if [[ "$LISTEN" == "127.0.0.1" ]]; then
+        banner "  Порт: ${PORT} (внутренний, за stream-мастером)   Внешний адрес: $(link_external)"
+    else
+        banner "  Порт: ${PORT}   Слушает: ${LISTEN:-0.0.0.0}"
+    fi
     [[ -n "$INBOUND_ID" ]] && banner "  ID inbound в панели: ${INBOUND_ID}"
     banner ""
 
@@ -2413,6 +2456,27 @@ create_channel() {
         gen_reality_keys
         REALITY_SETTINGS_JSON="$(reality_settings "$REALITY_TARGET" "$REALITY_SNI")"
         info "REALITY: домен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
+        # XHTTP не терпит рассинхрона версий ядер клиента и сервера (например,
+        # v2rayNG 26.6.27 vs панель 26.7.28 — трафик не идёт при исправном
+        # REALITY-хендшейке). Сообщаем версию панели до выдачи ссылки.
+        local xray_ver
+        xray_ver="$(xray_version)"
+        if [[ -n "$xray_ver" ]]; then
+            warn "XHTTP требует ОДИНАКОВУЮ версию Xray-ядра на клиенте и сервере."
+            warn "Ядро панели: $xray_ver — настрой клиент (v2rayNG) на ту же версию."
+        fi
+    fi
+    if [[ "$TRANSPORT" == "hysteria" ]]; then
+        # Hysteria2 верифицирует TLS по SNI. Без него клиент подставляет IP —
+        # сертификат панели не совпадает, рукопожатие падает. Берём внешний
+        # адрес (домен из SAN сертификата или IP сервера).
+        SNI="$(external_addr)"
+    fi
+    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" ]]; then
+        # Вариант «за nginx»: инбаунд сидит на 127.0.0.1:<порт> и наружу не
+        # смотрит — снаружи виден только 443, маршрутизацию по SNI делает
+        # stream-мастер (ssl_preread + proxy_protocol).
+        LISTEN="127.0.0.1"
     fi
 
     local settings_json stream_json snf_json
@@ -2431,10 +2495,19 @@ create_channel() {
     db_add_client_records "$INBOUND_ID"
     ok "Клиент «$CLIENT_EMAIL» добавлен."
 
-    # Прямые порты инбаундов (без прокси) открываем в firewall.
-    firewall_port_open "$PORT" "$CHANNEL_PROTO"
+    # Прямые порты инбаундов (без прокси) открываем в firewall. За stream-мастером
+    # инбаунд слушает 127.0.0.1 — наружу он не смотрит, открывать нечего.
+    if [[ "$LISTEN" != "127.0.0.1" ]]; then
+        firewall_port_open "$PORT" "$CHANNEL_PROTO"
+    fi
 
     restart_xui
+
+    # Новый SNI (xhttp+reality за мастером) должен попасть в map stream-мастера,
+    # иначе внешние подключения уйдут в default.
+    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+        nginx_stream_master_rebuild || warn "Не удалось пересобрать stream-мастер после создания инбаунда."
+    fi
 
     print_summary
 }
