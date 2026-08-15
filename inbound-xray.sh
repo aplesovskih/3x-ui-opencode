@@ -1691,8 +1691,14 @@ stream_master_apply_proxy_protocol() {
         settings="$(sqlite3 "$XUI_DB" "SELECT stream_settings FROM inbounds WHERE id = $id;" 2>/dev/null || true)"
         if printf '%s' "$settings" | grep -q '"acceptProxyProtocol"'; then
             new_settings="$(printf '%s' "$settings" | sed -E 's/"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)/"acceptProxyProtocol": '"$accept"'/')"
-        else
+        elif printf '%s' "$settings" | grep -q '"sockopt"[[:space:]]*:[[:space:]]*{'; then
+            # XHTTP: acceptProxyProtocol лежит в sockopt (не в tcpSettings).
+            new_settings="$(printf '%s' "$settings" | sed 's/"sockopt"[[:space:]]*:[[:space:]]*{/"sockopt": {\n    "acceptProxyProtocol": '"$accept"',/')"
+        elif printf '%s' "$settings" | grep -q '"tcpSettings"[[:space:]]*:[[:space:]]*{'; then
             new_settings="$(printf '%s' "$settings" | sed 's/"tcpSettings"[[:space:]]*:[[:space:]]*{/"tcpSettings": {\n    "acceptProxyProtocol": '"$accept"',/')"
+        else
+            warn "Не удалось вставить acceptProxyProtocol (id=$id): нет ни sockopt, ни tcpSettings."
+            continue
         fi
         sqlite3 "$XUI_DB" "UPDATE inbounds SET stream_settings = '$(sql_escape "$new_settings")' WHERE id = $id;" \
             || warn "Не удалось обновить acceptProxyProtocol (id=$id)."
@@ -1701,6 +1707,176 @@ stream_master_apply_proxy_protocol() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui >/dev/null 2>&1; then
         restart_xui
     fi
+}
+
+# panel_audit — read-only проверка XHTTP+REALITY каналов и пользователей,
+# созданных через панель (не скриптом). Панельные каналы не получают настройки
+# nginx автоматически, поэтому могут остаться нерабочими: target=127.0.0.1:443
+# (рекурсия REALITY), без hosts-записи (подписка отдаёт внутренний порт),
+# без строки SNI в map мастера, без acceptProxyProtocol. Вызывается при старте
+# скрипта и только сообщает о проблемах; исправление — пунктом меню (panel_sync).
+panel_audit() {
+    [[ "$STREAM_443_MASTER" == "1" ]] || return 0
+    [[ -n "$XUI_DB" && -f "$XUI_DB" ]] || return 0
+    local id="" port="" tag="" sni="" target="" pp="" hcount="" want="" esc=""
+    local issues=0
+    want="127.0.0.1:${REALITY_TARGET_PORT:-9443}"
+    banner ""
+    banner "  ========== Проверка каналов панели =========="
+    while IFS='|' read -r id port tag sni target pp; do
+        [[ -n "$id" ]] || continue
+        if [[ "$tag" == inbound-* ]]; then
+            printf '  канал id=%s (порт %s): %s (скрипт)\n' "$id" "$port" "${sni:-<нет SNI>}"
+        else
+            printf '  канал id=%s (порт %s): %s (ПАНЕЛЬ)\n' "$id" "$port" "${sni:-<нет SNI>}"
+        fi
+        if [[ -n "$sni" ]]; then
+            esc="${sni//./\\.}"
+            if ! grep -Eqs "^[[:space:]]*${esc}[[:space:]]+127\.0\.0\.1:[0-9]+;" "$NGINX_STREAM" 2>/dev/null; then
+                warn "SNI ${sni} отсутствует в map stream-мастера — канал не маршрутизируется (исправит пункт 5)."
+                issues=$((issues + 1))
+            fi
+        fi
+        if [[ "$target" != "$want" ]]; then
+            warn "target=${target:-<пусто>} вместо ${want} — рекурсия REALITY ломает канал (исправит пункт 5)."
+            issues=$((issues + 1))
+        fi
+        hcount="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id;" 2>/dev/null || true)"
+        if [[ -n "$hcount" && "$hcount" == "0" ]]; then
+            warn "Нет hosts-записи для канала id=$id — подписка отдаст внутренний порт (исправит пункт 5)."
+            issues=$((issues + 1))
+        fi
+        if [[ "$pp" != "true" && "$pp" != "1" ]]; then
+            warn "acceptProxyProtocol != true (id=$id) — nginx шлёт PROXY-заголовок, канал может рвать соединения (исправит пункт 5)."
+            issues=$((issues + 1))
+        fi
+    done < <(sqlite3 "$XUI_DB" "
+SELECT i.id, i.port, i.tag,
+       COALESCE(json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.realitySettings.target'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.sockopt.acceptProxyProtocol'), '')
+FROM inbounds i
+WHERE i.protocol = 'vless'
+  AND i.listen = '127.0.0.1'
+  AND json_extract(i.stream_settings, '$.network') = 'xhttp'
+  AND json_extract(i.stream_settings, '$.security') = 'reality'
+  AND i.port != ${STREAM_MASTER_PORT:-443}
+ORDER BY i.id;" 2>/dev/null || true)
+    # Пользователи (клиенты) панели
+    local bad_clients=0 cid="" cemail=""
+    while IFS='|' read -r cid cemail; do
+        [[ -n "$cid" ]] || continue
+        warn "У клиента «$cemail» (id=$cid) нет subId — подписка для него не отдаст ссылку (исправит пункт 5)."
+        bad_clients=$((bad_clients + 1))
+    done < <(sqlite3 "$XUI_DB" "SELECT id, email FROM clients WHERE sub_id IS NULL OR sub_id = '';" 2>/dev/null || true)
+    while IFS='|' read -r cid cemail; do
+        [[ -n "$cid" ]] || continue
+        warn "Клиент «$cemail» (id=$cid) не привязан ни к одному инбаунду (client_inbounds пусто)."
+        bad_clients=$((bad_clients + 1))
+    done < <(sqlite3 "$XUI_DB" "SELECT c.id, c.email FROM clients c LEFT JOIN client_inbounds ci ON ci.client_id = c.id WHERE ci.client_id IS NULL;" 2>/dev/null || true)
+    if (( issues == 0 && bad_clients == 0 )); then
+        ok "Каналы и пользователи панели в порядке (stream-мастер активен)."
+    else
+        warn "Найдено несоответствий: $issues (каналы), $bad_clients (клиенты). Исправление — пункт меню 5."
+    fi
+}
+
+# panel_sync — применяет к XHTTP+REALITY каналам (созданным через панель)
+# недостающие настройки прокси: target-заглушку 127.0.0.1:9443, hosts-запись
+# для подписки, acceptProxyProtocol=true; генерирует subId клиентам без него
+# и пересобирает stream-мастер. Вызывается из меню (пункт 5), идемпотентна.
+panel_sync() {
+    [[ "$STREAM_443_MASTER" == "1" ]] || { warn "stream-мастер не активен — синхронизация не нужна."; return 0; }
+    [[ -n "$XUI_DB" && -f "$XUI_DB" ]] || return 0
+    local changed=0 id="" port="" tag="" sni="" path="" target="" pp="" settings="" new_settings="" want="" esc="" esc_email=""
+    local want="127.0.0.1:${REALITY_TARGET_PORT:-9443}"
+    banner ""
+    banner "  ========== Синхронизация каналов панели =========="
+    while IFS='|' read -r id port tag sni path target pp; do
+        [[ -n "$id" ]] || continue
+        # 1) target: рекурсия REALITY (127.0.0.1:443 / внешний адрес) → заглушка
+        if [[ "$target" != "$want" ]]; then
+            settings="$(sqlite3 "$XUI_DB" "SELECT stream_settings FROM inbounds WHERE id = $id;" 2>/dev/null || true)"
+            new_settings="$(sed -E "s/\"target\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"target\": \"${want}\"/" <<< "$settings")"
+            if [[ -n "$new_settings" && "$new_settings" != "$settings" ]]; then
+                sqlite3 "$XUI_DB" "UPDATE inbounds SET stream_settings = '$(sql_escape "$new_settings")' WHERE id = $id;" \
+                    && ok "target канала id=$id: ${target:-<пусто>} → ${want}" && changed=1 \
+                    || warn "Не удалось обновить target (id=$id)."
+            fi
+        fi
+        # 2) hosts-запись для подписки (address=SNI:443)
+        if [[ -n "$sni" ]]; then
+            db_ensure_host_record "$id" "$sni" "$path"
+        fi
+        # 3) acceptProxyProtocol=true (xhttp → sockopt)
+        if [[ "$pp" != "true" && "$pp" != "1" ]]; then
+            settings="$(sqlite3 "$XUI_DB" "SELECT stream_settings FROM inbounds WHERE id = $id;" 2>/dev/null || true)"
+            if [[ "$settings" == *'"acceptProxyProtocol"'* ]]; then
+                new_settings="$(sed -E 's/"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)/"acceptProxyProtocol": true/' <<< "$settings")"
+            elif [[ "$settings" == *'"sockopt"'* ]]; then
+                new_settings="$(sed 's/"sockopt"[[:space:]]*:[[:space:]]*{/"sockopt": {\n    "acceptProxyProtocol": true,/' <<< "$settings")"
+            else
+                new_settings=""
+                warn "acceptProxyProtocol нельзя вставить (id=$id): нет sockopt в stream_settings."
+            fi
+            if [[ -n "$new_settings" && "$new_settings" != "$settings" ]]; then
+                sqlite3 "$XUI_DB" "UPDATE inbounds SET stream_settings = '$(sql_escape "$new_settings")' WHERE id = $id;" \
+                    && ok "acceptProxyProtocol=true для канала id=$id" && changed=1 \
+                    || warn "Не удалось обновить acceptProxyProtocol (id=$id)."
+            fi
+        fi
+    done < <(sqlite3 "$XUI_DB" "
+SELECT i.id, i.port, i.tag,
+       COALESCE(json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.xhttpSettings.path'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.realitySettings.target'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.sockopt.acceptProxyProtocol'), '')
+FROM inbounds i
+WHERE i.protocol = 'vless'
+  AND i.listen = '127.0.0.1'
+  AND json_extract(i.stream_settings, '$.network') = 'xhttp'
+  AND json_extract(i.stream_settings, '$.security') = 'reality'
+  AND i.port != ${STREAM_MASTER_PORT:-443}
+ORDER BY i.id;" 2>/dev/null || true)
+    # 4) Клиенты без subId: генерируем, пишем в clients и в settings инбаундов,
+    #    и привязываем к инбаунду (client_inbounds), если привязки нет.
+    local cid="" cemail="" new_sub="" bindc=""
+    while IFS='|' read -r cid cemail; do
+        [[ -n "$cid" ]] || continue
+        new_sub="$(gen_hex 16)"
+        sqlite3 "$XUI_DB" "UPDATE clients SET sub_id = '$new_sub' WHERE id = $cid;" 2>/dev/null || true
+        esc_email="$(sql_escape "$cemail")"
+        local iids="" iid=""
+        iids="$(sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE settings LIKE '%\"email\"%${esc_email}%';" 2>/dev/null || true)"
+        while read -r iid; do
+            [[ -n "$iid" ]] || continue
+            settings="$(sqlite3 "$XUI_DB" "SELECT settings FROM inbounds WHERE id = $iid;" 2>/dev/null || true)"
+            esc="$(sed 's/[.[\*^$(){}?+|]/\\./g' <<< "$cemail")"
+            new_settings="$(sed -E "s/(\"email\"[[:space:]]*:[[:space:]]*\"${esc}\"[^{]*\"subId\"[[:space:]]*:[[:space:]]*\")[^\"]*/\1${new_sub}/" <<< "$settings")"
+            if [[ -n "$new_settings" && "$new_settings" != "$settings" ]]; then
+                sqlite3 "$XUI_DB" "UPDATE inbounds SET settings = '$(sql_escape "$new_settings")' WHERE id = $iid;" 2>/dev/null || true
+            fi
+            bindc="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM client_inbounds WHERE client_id = $cid AND inbound_id = $iid;" 2>/dev/null || true)"
+            if [[ -n "$bindc" && "$bindc" == "0" ]]; then
+                sqlite3 "$XUI_DB" "INSERT INTO client_inbounds (client_id, inbound_id) VALUES ($cid, $iid);" 2>/dev/null \
+                    && ok "Клиент «$cemail» привязан к инбаунду id=$iid." \
+                    || warn "Не удалось привязать клиента «$cemail» к инбаунду id=$iid."
+            fi
+        done <<< "$iids"
+        ok "Клиенту «$cemail» присвоен subId ${new_sub} (в clients и settings инбаундов)."
+        changed=1
+    done < <(sqlite3 "$XUI_DB" "SELECT id, email FROM clients WHERE sub_id IS NULL OR sub_id = '';" 2>/dev/null || true)
+    # 5) Применение: перезапуск панели + пересборка nginx
+    if (( changed )); then
+        restart_xui
+    fi
+    nginx_stream_master_rebuild || warn "Не удалось пересобрать stream-мастер."
+    if [[ -n "$PANEL_HOST" ]]; then
+        nginx_reality_target_server "$PANEL_HOST" || true
+    fi
+    stream_master_apply_proxy_protocol || true
+    ok "Синхронизация панельных каналов завершена."
+    panel_audit
 }
 
 # nginx_stream_master_setup [auto] — включает режим stream-мастера на 443.
@@ -2715,6 +2891,8 @@ WHERE i.listen = '127.0.0.1'
     else
         info "Подписка пользователя уже включена: $(sub_url "${CLIENT_SUBID:-<subId>}")"
     fi
+    # Отчёт о каналах/пользователях, созданных через панель (исправление — пункт 5)
+    panel_audit
 
     while true; do
         banner ""
@@ -2723,15 +2901,17 @@ WHERE i.listen = '127.0.0.1'
         echo "   2) Включить заглушку (панель скрыть на пути, корень → сайт)"
         echo "   3) Отключить заглушку (панель на корень)"
         echo "   4) Удалить инбаунд"
+        echo "   5) Синхронизировать каналы, созданные через панель"
         echo "   0) Выход"
         echo "===================================="
         local ans=""
-        read -r -p "Ваш выбор [0-4]: " ans || exit 0
+        read -r -p "Ваш выбор [0-5]: " ans || exit 0
         case "$ans" in
             1) create_channel ;;
             2) setup_landing ;;
             3) disable_landing ;;
             4) delete_channel ;;
+            5) panel_sync ;;
             0|q|Q|exit) break ;;
             *) warn "Неверный выбор." ;;
         esac
