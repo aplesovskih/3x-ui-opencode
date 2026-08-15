@@ -47,6 +47,8 @@ STREAM_443_MASTER=""
 PANEL_SSL_PORT="8443"
 # Внешний порт stream-мастера
 STREAM_MASTER_PORT="443"
+# Внутренний https-порт nginx для REALITY target-заглушки
+REALITY_TARGET_PORT="9443"
 LANDING_DIR="/var/www/landing"
 LANDING_INDEX="$LANDING_DIR/index.html"
 
@@ -212,6 +214,94 @@ nginx_install_stream_module() {
     command -v nginx >/dev/null 2>&1 || { warn "nginx не установился после замены пакета."; return 1; }
     nginx_test_ok || { warn "nginx -t всё ещё не проходит:"; warn "$NGINX_TEST_ERR"; return 1; }
     return 0
+}
+
+# nginx_reality_target_server — внутренний https-сервер 127.0.0.1:9443 для
+# REALITY target (заглушка). Без него target="${REALITY_SNI}:443" рекурсивно
+# указывает на сам сервер: невалидные зонды уходят в петлю nginx→xray→nginx,
+# а валидный XHTTP-клиент молча обрывается. Заглушка отдаёт фейковый TLS-ответ.
+# Сертификат: корневой Let's Encrypt (если есть), иначе сертификат панели,
+# иначе self-signed.
+nginx_reality_target_server() {
+    local port="${REALITY_TARGET_PORT:-9443}"
+    local root_dom="" cert="" key="" conf="/etc/nginx/conf.d/reality-target.conf" bak=""
+    root_dom="$(domain_root "${PANEL_HOST:-$(external_addr)}")"
+    if [[ -n "$root_dom" && -f "/etc/letsencrypt/live/$root_dom/fullchain.pem" ]]; then
+        cert="/etc/letsencrypt/live/$root_dom/fullchain.pem"
+        key="/etc/letsencrypt/live/$root_dom/privkey.pem"
+    elif [[ -n "$PANEL_CERT" && -n "$PANEL_CERT_KEY" && -f "$PANEL_CERT" && -f "$PANEL_CERT_KEY" ]]; then
+        cert="$PANEL_CERT"; key="$PANEL_CERT_KEY"
+    fi
+    if [[ -z "$cert" || -z "$key" ]]; then
+        gen_selfsigned_inbound_cert
+        cert="$PANEL_CERT"; key="$PANEL_CERT_KEY"
+    fi
+    mkdir -p "$LANDING_DIR"
+    if [[ ! -f "$LANDING_INDEX" ]]; then
+        printf '%s\n' '<!doctype html><html><head><meta charset="utf-8"><title>It works</title></head><body><h1>It works!</h1></body></html>' > "$LANDING_INDEX"
+    fi
+    bak="$(mktemp)"
+    if [[ -f "$conf" ]]; then cp -a "$conf" "$bak"; fi
+    {
+        printf '%s\n' "# inbound-xray.sh: REALITY target-заглушка (127.0.0.1:${port}, ${root_dom:-<домен>})"
+        printf '%s\n' "server {"
+        printf '    listen 127.0.0.1:%s ssl;\n' "$port"
+        printf '    server_name %s;\n' "${root_dom:-_}"
+        printf '    root %s;\n' "$LANDING_DIR"
+        printf '%s\n' '    index index.html;'
+        printf '    ssl_certificate %s;\n' "$cert"
+        printf '    ssl_certificate_key %s;\n' "$key"
+        printf '%s\n' '    ssl_protocols TLSv1.2 TLSv1.3;'
+        printf '%s\n' '}'
+    } > "$conf"
+    if command -v nginx >/dev/null 2>&1 && ! nginx_test_ok; then
+        warn "nginx -t не прошёл — откат reality-target.conf."
+        warn "$NGINX_TEST_ERR"
+        if [[ -f "$bak" ]]; then cp -a "$bak" "$conf"; else rm -f "$conf"; fi
+        return 1
+    fi
+    rm -f "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    ok "REALITY target-заглушка: https://127.0.0.1:${port} (${root_dom:-<домен>})."
+}
+
+# nginx_worker_tune — поднимает лимиты воркера nginx. При stream-мастере ВСЕ
+# внешние соединения идут через единственный 443, и дефолтные worker_connections
+# 768 (RLIMIT_NOFILE 1024) быстро исчерпываются: nginx сбрасывает соединения
+# к xray («worker_connections are not enough»), клиент видит «подключён без
+# трафика». Устанавливаем worker_rlimit_nofile 65535 и worker_connections 8192.
+nginx_worker_tune() {
+    [[ -f "$NGINX_MAIN" ]] || { warn "Не найден $NGINX_MAIN — тюнинг worker пропущен."; return 1; }
+    local bak="" cur="" tuned=0
+    bak="$(mktemp)"; cp -a "$NGINX_MAIN" "$bak"
+    cur="$(grep -oE 'worker_connections[[:space:]]+[0-9]+' "$NGINX_MAIN" | grep -oE '[0-9]+$' | head -1)"
+    if [[ -n "$cur" && "$cur" -lt 8192 ]]; then
+        sed -i -E 's/worker_connections[[:space:]]+[0-9]+;/worker_connections 8192;/' "$NGINX_MAIN"
+        tuned=1
+    fi
+    if ! grep -Eqs 'worker_rlimit_nofile' "$NGINX_MAIN"; then
+        sed -i -E '0,/^[[:space:]]*worker_processes/s//worker_rlimit_nofile 65535;\n&/' "$NGINX_MAIN"
+        tuned=1
+    fi
+    if [[ "$tuned" != "1" ]]; then
+        info "Лимиты nginx worker уже подняты (worker_connections $cur)."
+        rm -f "$bak"
+        return 0
+    fi
+    if ! nginx_test_ok; then
+        warn "nginx -t не прошёл после тюнинга worker — откат."
+        warn "$NGINX_TEST_ERR"
+        cp -a "$bak" "$NGINX_MAIN"
+        rm -f "$bak"
+        return 1
+    fi
+    rm -f "$bak"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    ok "nginx worker: worker_rlimit_nofile 65535, worker_connections 8192."
 }
 
 # ensure_tools <пакеты...> — проверяет наличие программ; при отсутствии
@@ -1034,6 +1124,25 @@ VALUES
    '$(sql_escape "$tag")', '$(sql_escape "$snf")', 1, NULL, 'custom', '$(sql_escape "$share_addr")',
    '', 1${time_vals});
 SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в базу."
+}
+
+# db_ensure_host_record <inbound_id> <sni> <path> — hosts-запись для инбаунда
+# за stream-мастером. Без неё подписка отдаёт inbounds.port (например 10000),
+# а снаружи открыт только 443 → «подключён без трафика». address=sni, port=443.
+db_ensure_host_record() {
+    local id="${1:-}" sni="${2:-}" path="${3:-}"
+    [[ -n "$id" && -n "$sni" ]] || return 0
+    local exists=""
+    exists="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id;" 2>/dev/null || true)"
+    [[ -n "$exists" && "$exists" != "0" ]] && return 0
+    local time_cols="" time_vals=""
+    if db_has_column hosts created_at; then
+        time_cols=", created_at, updated_at"
+        time_vals=", $(date +%s000), $(date +%s000)"
+    fi
+    sqlite3 "$XUI_DB" "INSERT INTO hosts (inbound_id, remark, address, port, security, sni, host_header, path, alpn, fingerprint${time_cols}) VALUES ($id, 'master-$(sql_escape "$sni")', '$(sql_escape "$sni")', ${STREAM_MASTER_PORT:-443}, 'reality', '$(sql_escape "$sni")', '', '$(sql_escape "$path")', '', 'chrome'${time_vals});" 2>/dev/null \
+        || warn "Не удалось создать hosts-запись для inbound id=$id."
+    ok "hosts-запись для подписки: ${sni}:${STREAM_MASTER_PORT:-443}"
 }
 
 # db_add_client_records <inbound_id> — таблицы clients/client_inbounds/client_traffics.
@@ -2438,8 +2547,15 @@ create_channel() {
             ask "Домен REALITY (SNI маскировки, A-запись → сервер)" "$base_domain" CHANNEL_SNI
             [[ -n "$CHANNEL_SNI" ]] || { warn "Домен REALITY обязателен."; continue; }
             if [[ -n "$PANEL_HOST" && "$CHANNEL_SNI" == "$PANEL_HOST" ]]; then
+                if [[ "$STREAM_443_MASTER" == "1" ]]; then
+                    die "SNI=$CHANNEL_SNI совпадает с доменом панели: на 443 канал перехватит весь трафик панели. Укажи отдельный поддомен (напр. v.${base_domain:-<домен>})."
+                fi
                 warn "SNI совпадает с доменом панели: панель и REALITY будут конфликтовать на 443."
                 warn "Переведи панель на поддомен (напр. p.${base_domain:-<домен>}) или укажи другой SNI."
+            fi
+            if [[ "$STREAM_443_MASTER" == "1" && -n "$PANEL_HOST" \
+                && "$CHANNEL_SNI" == "$(domain_root "$PANEL_HOST")" ]]; then
+                die "SNI=$CHANNEL_SNI — корневой домен панели: заглушка корня/панель сломаются на 443. Укажи поддомен (напр. v.${CHANNEL_SNI})."
             fi
             if db_sni_in_use "$CHANNEL_SNI" reality; then
                 warn "SNI $CHANNEL_SNI уже используется другим REALITY-инбаундом."
@@ -2450,9 +2566,16 @@ create_channel() {
         done
         REALITY_SNI="$CHANNEL_SNI"
         SNI="$REALITY_SNI"
-        # XHTTP+REALITY слушает прямой TCP-порт без nginx: target — внешний
-        # домен поддомена:443 (сайт-прикрытие для REALITY-хендшейка).
-        REALITY_TARGET="${REALITY_SNI}:443"
+        # Target REALITY: за stream-мастером — локальная nginx-заглушка
+        # 127.0.0.1:9443 (иначе target="${REALITY_SNI}:443" рекурсивно указывает
+        # на сам сервер: XHTTP+REALITY ломается — невалидные зонды уходят в
+        # петлю nginx→xray, а валидный клиент молча обрывается после ServerHello).
+        # На прямом порту — внешний домен поддомена:443 (сайт-прикрытие).
+        if [[ "$STREAM_443_MASTER" == "1" ]]; then
+            REALITY_TARGET="127.0.0.1:${REALITY_TARGET_PORT:-9443}"
+        else
+            REALITY_TARGET="${REALITY_SNI}:443"
+        fi
         gen_reality_keys
         REALITY_SETTINGS_JSON="$(reality_settings "$REALITY_TARGET" "$REALITY_SNI")"
         info "REALITY: домен=${REALITY_SNI}, target=${REALITY_TARGET}, ключи сгенерированы."
@@ -2494,6 +2617,11 @@ create_channel() {
     ok "Инбаунд добавлен (inbound id=${INBOUND_ID})."
     db_add_client_records "$INBOUND_ID"
     ok "Клиент «$CLIENT_EMAIL» добавлен."
+    # XHTTP+REALITY за мастером: hosts-запись, чтобы подписка отдавала
+    # <SNI>:443, а не внутренний inbounds.port (снаружи закрыт ufw).
+    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$REALITY_SNI" ]]; then
+        db_ensure_host_record "$INBOUND_ID" "$REALITY_SNI" "$WS_PATH"
+    fi
 
     # Прямые порты инбаундов (без прокси) открываем в firewall. За stream-мастером
     # инбаунд слушает 127.0.0.1 — наружу он не смотрит, открывать нечего.
@@ -2507,6 +2635,11 @@ create_channel() {
     # иначе внешние подключения уйдут в default.
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
         nginx_stream_master_rebuild || warn "Не удалось пересобрать stream-мастер после создания инбаунда."
+        # REALITY target-заглушка обязательна: без неё target указывает на сам
+        # сервер (рекурсия ломает XHTTP+REALITY — см. nginx_reality_target_server).
+        if [[ "$TRANSPORT" == "xhttp" ]]; then
+            nginx_reality_target_server "$REALITY_SNI" || warn "Не удалось настроить REALITY target-заглушку."
+        fi
     fi
 
     print_summary
@@ -2548,9 +2681,33 @@ main() {
             local pmode="panel"
             [[ -n "$ENABLE_LANDING" ]] && pmode="landing"
             write_panel_conf "$pconf" "$pmode" || warn "Не удалось обновить конфиг панели (proxy_protocol)."
+            # Лимиты воркера nginx (иначе 768 коннекшнов не хватает на единственный
+            # 443 и соединения к xray сбрасываются — «подключён без трафика»).
+            nginx_worker_tune || true
+            # REALITY target-заглушка: без неё xhttp+reality ломается рекурсией.
+            if [[ -n "$PANEL_HOST" ]]; then
+                nginx_reality_target_server "$PANEL_HOST" || true
+            fi
         else
             nginx_stream_master_setup auto
         fi
+    fi
+    # Миграция hosts-записей для существующих XHTTP+REALITY каналов за мастером:
+    # старые каналы создавались без hosts-записи, подписка отдавала внутренний
+    # inbounds.port (снаружи закрыт). address=SNI, port=443.
+    if [[ "$STREAM_443_MASTER" == "1" ]]; then
+        local hid="" hsni="" hpath=""
+        while IFS='|' read -r hid hsni hpath; do
+            [[ -n "$hid" ]] || continue
+            db_ensure_host_record "$hid" "$hsni" "$hpath"
+        done < <(sqlite3 "$XUI_DB" "
+SELECT i.id,
+       json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'),
+       json_extract(i.stream_settings, '$.xhttpSettings.path')
+FROM inbounds i
+WHERE i.listen = '127.0.0.1'
+  AND json_extract(i.stream_settings, '$.network') = 'xhttp'
+  AND json_extract(i.stream_settings, '$.security') = 'reality';" 2>/dev/null)
     fi
     # Подписка включается автоматически при первом запуске (без пункта меню)
     if [[ "$SUB_ENABLE" != "true" ]]; then
