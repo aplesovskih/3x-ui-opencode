@@ -6,7 +6,9 @@
 #   * создание inbound для двух протоколов: VLESS+XHTTP+REALITY и Hysteria2;
 #   * создание клиентов панели и генерация share-ссылок (vless://, hy2://);
 #   * XHTTP+REALITY слушает прямой TCP-порт (без nginx): REALITY-target — сайт
-#     прикрытия по домену SNI, клиент в режиме mode=stream-one;
+#     прикрытия по домену SNI, клиент в режиме mode=stream-one; в режиме
+#     stream-мастера инбаунд слушает 127.0.0.1 за nginx, наружу — единый 443
+#     (маршрутизация по SNI);
 #   * Hysteria2 — UDP, сертификат панели (или self-signed);
 #   * nginx-инфраструктура панели: «всё через 443» (stream-мастер с ssl_preread),
 #     конфиг панели с proxy_protocol, заглушка-сайт на корневом адресе;
@@ -18,13 +20,14 @@
 # Запись в конфигурацию панели выполняется напрямую в базу данных
 # (sqlite3) с последующим перезапуском x-ui — без REST API.
 #
-# *** ВАЖНО: поддержка панели 3x-ui v3.6+ (формат базы данных). ***
+# *** ВАЖНО: поддержка панели 3x-ui v3.6+ (формат базы данных), только SQLite. ***
 # На более старых версиях панели схема таблиц отличается — не работает.
 #
 # Использование:  bash inbound-xray.sh
 # Переменные окружения:
 #   XUI_DB  — путь к базе панели (по умолчанию /etc/x-ui/x-ui.db)
 #   XUI_XRAY — путь к бинарнику xray (по умолчанию /usr/local/x-ui/bin/xray)
+#   XUI_LOG — путь к логу (по умолчанию /var/log/setup-xray.log)
 # =============================================================================
 
 set -euo pipefail
@@ -41,7 +44,7 @@ NGINX_STREAM="/etc/nginx/stream-enabled/stream.conf"
 PANEL_STATE="/etc/nginx/inbound-xray.state"
 NGINX_CONF="/etc/nginx/conf.d/x-ui.conf"
 NGINX_MAIN="/etc/nginx/nginx.conf"
-# 1 = всё внешнее трафик (http + stream) уже переведено на единый 443
+# 1 = весь внешний трафик (http + stream) уже переведено на единый 443
 STREAM_443_MASTER=""
 # Внутренний https-порт nginx (панель + WS/gRPC), внешний слушает stream-мастер
 PANEL_SSL_PORT="8443"
@@ -58,6 +61,10 @@ SERVER_IP=""
 PANEL_CERT=""
 PANEL_CERT_KEY=""
 PANEL_CERT_DIR=""
+# Сертификат канала (self-signed, выпускается gen_selfsigned_inbound_cert) —
+# отдельно от PANEL_CERT, чтобы не подменять сертификат панели.
+INBOUND_CERT=""
+INBOUND_CERT_KEY=""
 PANEL_PORT=""
 PANEL_PATH=""
 PANEL_PROTO="http"
@@ -91,8 +98,6 @@ REALITY_TARGET=""
 REALITY_SETTINGS_JSON=""
 
 # Параметры REALITY-домена и переиспользуемого клиента
-CHANNEL_SNI=""
-CHANNEL_CERT_DIR=""
 REUSE_CLIENT=""
 EXISTING_CLIENT_ID=""
 
@@ -104,7 +109,6 @@ else
     C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""; C_RESET=""
 fi
 
-log()  { printf '%s\n' "$*" | tee -a "$LOG_FILE"; }
 info() { printf '%s\n' "$*" | tee -a "$LOG_FILE"; }
 ok()   { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*" | tee -a "$LOG_FILE"; }
 warn() { printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" | tee -a "$LOG_FILE"; }
@@ -141,6 +145,7 @@ confirm() {
 # --- Инициализация лога ---------------------------------------------------------
 setup_log() {
     [[ -d /var/log ]] && : > "$LOG_FILE" 2>/dev/null || LOG_FILE="${TMPDIR:-/tmp}/setup-xray.log"
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
     {
         echo "===== $(date '+%Y-%m-%d %H:%M:%S') inbound-xray.sh v${SCRIPT_VERSION} ====="
         echo "Пользователь: $(id -un 2>/dev/null || echo unknown)"
@@ -171,7 +176,7 @@ detect_os() {
         esac
     fi
     [[ -n "$PKG_MANAGER" ]] || die "Не удалось определить менеджер пакетов — установка невозможна. Установите зависимости вручную и повторите."
-    log "Менеджер пакетов: $PKG_MANAGER"
+    info "Менеджер пакетов: $PKG_MANAGER"
 }
 
 # install_pkg <пакеты...> — установка через системный менеджер пакетов.
@@ -234,7 +239,7 @@ nginx_reality_target_server() {
     fi
     if [[ -z "$cert" || -z "$key" ]]; then
         gen_selfsigned_inbound_cert
-        cert="$PANEL_CERT"; key="$PANEL_CERT_KEY"
+        cert="$INBOUND_CERT"; key="$INBOUND_CERT_KEY"
     fi
     mkdir -p "$LANDING_DIR"
     if [[ ! -f "$LANDING_INDEX" ]]; then
@@ -333,6 +338,11 @@ require_tools() {
 
 require_panel() {
     [[ -f "$XUI_DB" ]] || die "База панели не найдена: $XUI_DB. Сначала установите 3x-ui (install.sh)."
+    # Панель на PostgreSQL не поддерживается: при XUI_DB_TYPE=postgres записи
+    # скрипта уйдут в неиспользуемый SQLite-файл, панель их не увидит.
+    if [[ -f /etc/default/x-ui ]] && grep -Eqs "XUI_DB_TYPE[[:space:]]*=[[:space:]]*[\"']?postgres" /etc/default/x-ui; then
+        die "Панель настроена на PostgreSQL (XUI_DB_TYPE=postgres в /etc/default/x-ui) — скрипт поддерживает только SQLite."
+    fi
     sqlite3 "$XUI_DB" "SELECT 1;" >/dev/null 2>&1 || die "Не удалось открыть базу панели: $XUI_DB."
     command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui >/dev/null 2>&1 \
         || warn "Сервис x-ui не активен. Настройка продолжится, но для применения нужен запуск x-ui."
@@ -488,6 +498,12 @@ detect_server_ip() {
     local ip=""
     ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
     [[ -n "$ip" ]] && SERVER_IP="$ip"
+    # Все источники отказали: без IP ссылки станут vless://UUID@:port — не выдаём молча
+    if [[ -z "$SERVER_IP" ]]; then
+        warn "Не удалось определить внешний IP автоматически."
+        ask "Введите внешний IP сервера вручную" "" SERVER_IP
+        [[ -n "$SERVER_IP" ]] || die "Внешний IP не указан — продолжение невозможно."
+    fi
 }
 
 # external_addr — внешний адрес для ссылок: домен из сертификата панели или IP.
@@ -556,8 +572,7 @@ load_panel_env() {
     fi
     [[ -n "$PANEL_PORT" ]] || die "Не удалось определить порт панели 3x-ui."
 
-    # Протокол панели — по факту (файлы серта + https-проба), а не по строке
-    # «Panel is secure with SSL»: см. detect_panel_proto.
+    # Протокол панели — по факту (файлы серта + https-проба): см. detect_panel_proto.
     PANEL_PROTO="$(detect_panel_proto "$PANEL_PORT")"
 
     # Учётные данные — из лога официального установщика (fallback: не критично)
@@ -724,12 +739,38 @@ port_in_use() {
 # next_free_port [proto] [min] [max] — печатает первый свободный порт.
 # Учитывает и занятость в БД панели (другой inbound на том же порту).
 next_free_port() {
-    local proto="${1:-tcp}" min="${2:-10000}" max="${3:-59999}" p
-    for p in $(seq "$min" "$max"); do
-        if ! port_in_use "$p" "$proto" && ! db_port_in_use "$p"; then
-            printf '%s' "$p"
-            return 0
+    local proto="${1:-tcp}" min="${2:-10000}" max="${3:-59999}" p port line
+    local -A taken=()
+    # Снимок занятых портов — один раз, без подпроцесса на каждую итерацию.
+    # ВАЖНО: строки ss/netstat заканчиваются адресом пира (0.0.0.0:*, LISTEN) —
+    # порт берём как последнее поле строки, оканчивающееся цифрой.
+    if command -v ss >/dev/null 2>&1; then
+        if [[ "$proto" == "udp" ]]; then
+            while IFS= read -r port; do
+                [[ -n "$port" ]] && taken["$port"]=1
+            done < <(ss -lun 2>/dev/null | awk '{for(i=NF;i>=1;i--) if ($i ~ /[0-9]+$/) {sub(/.*:/, "", $i); print $i; exit}}')
+        else
+            while IFS= read -r port; do
+                [[ -n "$port" ]] && taken["$port"]=1
+            done < <(ss -ltnH 2>/dev/null | awk '{for(i=NF;i>=1;i--) if ($i ~ /[0-9]+$/) {sub(/.*:/, "", $i); print $i; exit}}')
         fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if [[ "$proto" == "udp" ]]; then
+            while IFS= read -r port; do
+                [[ -n "$port" ]] && taken["$port"]=1
+            done < <(netstat -lun 2>/dev/null | awk '{for(i=NF;i>=1;i--) if ($i ~ /[0-9]+$/) {sub(/.*:/, "", $i); print $i; exit}}')
+        else
+            while IFS= read -r port; do
+                [[ -n "$port" ]] && taken["$port"]=1
+            done < <(netstat -ltn 2>/dev/null | awk '{for(i=NF;i>=1;i--) if ($i ~ /[0-9]+$/) {sub(/.*:/, "", $i); print $i; exit}}')
+        fi
+    fi
+    # Порты, занятые инбаундами панели — тоже одним запросом
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[0-9]+$ ]] && taken["$line"]=1
+    done < <(sqlite3 "$XUI_DB" "SELECT port FROM inbounds;" 2>/dev/null || true)
+    for p in $(seq "$min" "$max"); do
+        [[ -n "${taken[$p]:-}" ]] || { printf '%s' "$p"; return 0; }
     done
     return 1
 }
@@ -851,14 +892,8 @@ sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
 # Генераторы JSON-настроек inbound (формат базы 3x-ui v3.6+)
 # =============================================================================
 # Значения (uuid, ключи, пароли) не содержат двойных кавычек, поэтому JSON
-# собирается прямой подстановкой в heredoc-шаблоны.
+# собирается прямой подстановкой в printf-шаблоны.
 # =============================================================================
-
-# client_base <email> <subid> — общая часть клиента любого протокола.
-client_base() {
-    local email="$1" subid="$2"
-    printf '{\n    "email": "%s",\n    "limitIp": 0,\n    "totalGB": 0,\n    "expiryTime": 0,\n    "enable": true,\n    "tgId": 0,\n    "subId": "%s",\n    "comment": "",\n    "reset": 0\n  }' "$email" "$subid"
-}
 
 # make_client_data <protocol> <email> <subid> <flow> — генерирует данные клиента
 # и кладёт их в глобальные переменные CLIENT_* (используются и в JSON, и в ссылках).
@@ -867,8 +902,7 @@ make_client_data() {
     CLIENT_EMAIL="$2"
     CLIENT_SUBID="$3"
     CLIENT_FLOW="${4:-}"
-    CLIENT_ID=""; CLIENT_PW=""; CLIENT_AUTH=""
-    CLIENT_SECRET=""
+    CLIENT_ID=""; CLIENT_AUTH=""
     case "$proto" in
         vless)  CLIENT_ID="$(gen_uuid)" ;;
         hysteria) CLIENT_AUTH="$(gen_password 24)" ;;
@@ -911,30 +945,26 @@ build_settings() {
 
 # --- Сборка stream_settings ---------------------------------------------------------
 
-# tls_settings <serverName> [alpn] — JSON tlsSettings. Для инбаунда с уникальным SNI
-# (TCP+TLS) используется его собственный сертификат из CHANNEL_CERT_DIR,
-# иначе — сертификат панели; при отсутствии — self-signed.
+# tls_settings <serverName> [alpn] — JSON tlsSettings. Используется сертификат
+# панели; при его отсутствии — self-signed.
 # alpn передаётся готовым JSON-списком; по умолчанию ["h2","http/1.1"],
 # для hysteria нужен ["h3"] (QUIC/HTTP3).
 tls_settings() {
     local sni="${1:-}"
     local alpn="${2:-\"h2\", \"http/1.1\"}"
     local cert="$PANEL_CERT" key="$PANEL_CERT_KEY"
-    if [[ -n "${CHANNEL_CERT_DIR:-}" ]]; then
-        cert="$CHANNEL_CERT_DIR/fullchain.pem"
-        key="$CHANNEL_CERT_DIR/privkey.pem"
-    fi
-    if [[ -n "$cert" && -n "$key" ]]; then
-        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": [%s],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$cert" "$key" "$alpn"
-    else
+    if [[ -z "$cert" || -z "$key" ]]; then
         printf '%s[ WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "Сертификат не найден — будет выпущен self-signed для инбаунда." >&2
         gen_selfsigned_inbound_cert
-        printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": [%s],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$PANEL_CERT" "$PANEL_CERT_KEY" "$alpn"
+        cert="$INBOUND_CERT"; key="$INBOUND_CERT_KEY"
     fi
+    printf '{\n    "serverName": "%s",\n    "minVersion": "1.2",\n    "maxVersion": "1.3",\n    "cipherSuites": "",\n    "rejectUnknownSni": false,\n    "disableSystemRoot": false,\n    "enableSessionResumption": false,\n    "certificates": [\n      {\n        "certificateFile": "%s",\n        "keyFile": "%s",\n        "oneTimeLoading": false,\n        "usage": "encipherment",\n        "buildChain": false\n      }\n    ],\n    "alpn": [%s],\n    "echServerKeys": "",\n    "settings": {\n      "fingerprint": "chrome",\n      "echConfigList": ""\n    }\n  }' "$sni" "$cert" "$key" "$alpn"
 }
 
-# gen_selfsigned_inbound_cert — выпускает self-signed сертификат для инбаунда в
-# /etc/ssl/x-ui-inbound/<порт>/ (используется, когда у панели нет своего сертификата).
+# gen_selfsigned_inbound_cert — выпускает self-signed сертификат канала в
+# фиксированный каталог /etc/ssl/x-ui-inbound/chan (используется, когда у панели
+# нет своего сертификата). Результат — в INBOUND_CERT/INBOUND_CERT_KEY
+# (PANEL_CERT/PANEL_CERT_KEY не трогает).
 gen_selfsigned_inbound_cert() {
     local dir="/etc/ssl/x-ui-inbound/chan"
     mkdir -p "$dir"
@@ -951,8 +981,8 @@ gen_selfsigned_inbound_cert() {
             -addext "subjectAltName=IP:${SERVER_IP},DNS:${addr}" >/dev/null 2>&1 \
             || die "Не удалось выпустить self-signed сертификат."
     fi
-    PANEL_CERT="$dir/fullchain.pem"
-    PANEL_CERT_KEY="$dir/privkey.pem"
+    INBOUND_CERT="$dir/fullchain.pem"
+    INBOUND_CERT_KEY="$dir/privkey.pem"
 }
 
 
@@ -983,20 +1013,19 @@ gen_reality_keys() {
 reality_settings() {
     local target="${1:-yahoo.com:443}" sni="${2:-yahoo.com}"
     gen_reality_keys
-    REALITY_SNI="$sni"
     printf '{\n    "show": false,\n    "xver": 0,\n    "target": "%s",\n    "serverNames": ["%s"],\n    "privateKey": "%s",\n    "minClientVer": "",\n    "maxClientVer": "",\n    "maxTimediff": 0,\n    "shortIds": ["%s"],\n    "mldsa65Seed": "",\n    "settings": {\n      "publicKey": "%s",\n      "fingerprint": "chrome",\n      "serverName": "%s",\n      "spiderX": "/",\n      "mldsa65Verify": ""\n    }\n  }' "$target" "$sni" "$REALITY_PRIVATE_KEY" "$REALITY_SHORT_ID" "$REALITY_PUBLIC_KEY" "$sni"
 }
 
-# build_stream <network> <security> <path> <host> <cert_sni>
-# Печатает JSON "streamSettings". Доп. значения для security кладутся в глобальные
-# переменные (REALITY_*).
+# build_stream <network> <path> <sni> — печатает JSON "streamSettings".
+# Доп. значения для security кладутся в глобальные переменные (REALITY_*).
 #
 # Оставлены два транспорта:
 #   xhttp+reality — прямой TCP-порт (REALITY сам маскирует зондирование и
-#     поведенческий анализ), клиент использует mode=stream-one;
+#     поведенческий анализ), клиент использует mode=stream-one; в режиме
+#     stream-мастера инбаунд слушает 127.0.0.1 за nginx, наружу — единый 443;
 #   hysteria — UDP/QUIC (TLS), TLS терминирует сам xray.
 build_stream() {
-    local network="$1" path="${2:-/}" host="${3:-}" sni="${4:-}"
+    local network="$1" path="${2:-/}" sni="${3:-}"
     [[ "$path" == / ]] && path="/"
     case "$network" in
         xhttp)
@@ -1009,7 +1038,7 @@ build_stream() {
             else
                 local pp="false"
             fi
-            printf '{\n  "network": "xhttp",\n  "xhttpSettings": {\n    "path": "%s",\n    "host": "%s",\n    "headers": {}\n  },\n  "sockopt": {\n    "acceptProxyProtocol": %s,\n    "tcpFastOpen": true,\n    "tcpMptcp": true,\n    "tcpNoDelay": true,\n    "domainStrategy": "UseIP",\n    "tcpMaxSeg": 1440,\n    "tcpcongestion": "bbr"\n  },\n  "security": "reality",\n  "realitySettings": %s\n}' "$path" "$host" "$pp" "$REALITY_SETTINGS_JSON"
+            printf '{\n  "network": "xhttp",\n  "xhttpSettings": {\n    "path": "%s",\n    "host": "",\n    "headers": {}\n  },\n  "sockopt": {\n    "acceptProxyProtocol": %s,\n    "tcpFastOpen": true,\n    "tcpMptcp": true,\n    "tcpNoDelay": true,\n    "domainStrategy": "UseIP",\n    "tcpMaxSeg": 1440,\n    "tcpcongestion": "bbr"\n  },\n  "security": "reality",\n  "realitySettings": %s\n}' "$path" "$pp" "$REALITY_SETTINGS_JSON"
             ;;
         hysteria)
             # Для QUIC/HTTP3 обязателен alpn=["h3"], иначе клиент (v2rayNG с
@@ -1107,11 +1136,8 @@ db_insert_inbound() {
         time_vals=", $now, $now"
     fi
     local share_addr
-    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$REALITY_SNI" ]]; then
-        share_addr="$REALITY_SNI"
-    else
-        share_addr="$(external_addr)"
-    fi
+    share_addr="$(inbound_external_addr "$TRANSPORT" "$PORT" "$REALITY_SNI")"
+    share_addr="${share_addr%%:*}"
     INBOUND_ID="$(sqlite3 "$XUI_DB" "
 INSERT INTO inbounds
   (user_id, up, down, total, remark, enable, expiry_time, traffic_reset,
@@ -1130,11 +1156,13 @@ SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в б
 # за stream-мастером. Без неё подписка отдаёт inbounds.port (например 10000),
 # а снаружи открыт только 443 → «подключён без трафика». address=sni, port=443.
 db_ensure_host_record() {
-    local id="${1:-}" sni="${2:-}" path="${3:-}"
-    [[ -n "$id" && -n "$sni" ]] || return 0
-    local exists=""
-    exists="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id;" 2>/dev/null || true)"
-    [[ -n "$exists" && "$exists" != "0" ]] && return 0
+    local id="${1:-}" sni="${2:-}" path="${3:-}" skip_check="${4:-}"
+    [[ -n "$id" && "$sni" ]] || return 0
+    if [[ "$skip_check" != "skip" ]]; then
+        local exists=""
+        exists="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id;" 2>/dev/null || true)"
+        [[ -n "$exists" && "$exists" != "0" ]] && return 0
+    fi
     local time_cols="" time_vals=""
     if db_has_column hosts created_at; then
         time_cols=", created_at, updated_at"
@@ -1192,7 +1220,7 @@ load_existing_client() {
 db_add_client_records() {
     local inbound_id="$1" now cid
     now="$(date +%s000)"
-    local cl_pw="$CLIENT_PW"
+    # Колонки password/secret оставлены для совместимости схемы панели (всегда пустые).
     # email уже есть в clients? (уникальность) — обновить, иначе вставить
     local existing
     existing="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
@@ -1207,7 +1235,7 @@ db_add_client_records() {
             local upd
             upd="sub_id = '$(sql_escape "$CLIENT_SUBID")',
                 uuid = '$(sql_escape "$CLIENT_ID")',
-                password = '$(sql_escape "$cl_pw")',
+                password = '',
                 auth = '$(sql_escape "$CLIENT_AUTH")',
                 flow = '$(sql_escape "$CLIENT_FLOW")',
                 security = 'auto',
@@ -1217,7 +1245,7 @@ db_add_client_records() {
                 upd="$upd, updated_at = $now"
             fi
             if db_has_column clients secret; then
-                upd="$upd, secret = '$(sql_escape "$CLIENT_SECRET")'"
+                upd="$upd, secret = ''"
             fi
             sqlite3 "$XUI_DB" "UPDATE clients SET $upd WHERE id = $cid;" || die "Ошибка обновления клиента."
         fi
@@ -1227,7 +1255,7 @@ db_add_client_records() {
              limit_ip, total_gb, expiry_time, enable, tg_id, group_name,
              comment, reset"
         vals="('$(sql_escape "$CLIENT_EMAIL")', '$(sql_escape "$CLIENT_SUBID")', '$(sql_escape "$CLIENT_ID")',
-             '$(sql_escape "$cl_pw")', '$(sql_escape "$CLIENT_AUTH")', '$(sql_escape "$CLIENT_FLOW")',
+             '', '$(sql_escape "$CLIENT_AUTH")', '$(sql_escape "$CLIENT_FLOW")',
              'auto', '',
              0, 0, 0, 1, 0, '',
              '', 0"
@@ -1237,7 +1265,7 @@ db_add_client_records() {
         fi
         if db_has_column clients secret; then
             cols="$cols, secret"
-            vals="$vals, '$(sql_escape "$CLIENT_SECRET")'"
+            vals="$vals, ''"
         fi
         if db_has_column clients ad_tag; then
             cols="$cols, ad_tag"
@@ -1292,8 +1320,7 @@ restart_xui() {
 
 # sync_panel_webcert — приводит webCertFile/webKeyFile панели к фактическому
 # сертификату панели (PANEL_CERT/PANEL_CERT_KEY), если они расходятся.
-# Мёртвые пути (файлов нет на диске) заставляют панель отвечать по HTTP, хотя
-# она выводит «Panel is secure with SSL»: nginx шлёт TLS в HTTP-порт → 502.
+# Мёртвые пути сертификата заставляют панель отвечать по HTTP при выводе «Panel is secure with SSL»: nginx шлёт TLS в HTTP-порт → 502 (см. detect_panel_proto).
 # Кроме того, меню установщика x-ui (check_config) берёт домен из имени
 # каталога webCertFile — отсюда «адрес панели на основном домене». Если
 # PANEL_CERT не найден — пути очищаются (панель честно работает по HTTP).
@@ -1339,9 +1366,6 @@ urlencode() {
     printf '%s' "$out"
 }
 
-# b64url — base64 url-safe без padding.
-b64url() { printf '%s' "$1" | base64 | tr -d '=\n' | tr '+/' '-_'; }
-
 # json_extract <json> <ключ> [num|list] — значение поля из однострочного JSON.
 json_extract() {
     local json="$1" key="$2" mode="${3:-}"
@@ -1352,6 +1376,78 @@ json_extract() {
     esac
 }
 
+# inbound_sni <stream_settings> — SNI инбаунда: REALITY serverNames[0] или TLS serverName.
+inbound_sni() {
+    local ss="${1:-}"
+    printf '%s' "$ss" | sed -nE \
+        -e 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
+        -e 's/.*"serverName"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1
+}
+
+# stream_set_accept_proxy_protocol <settings> <true|false> — печатает settings
+# с acceptProxyProtocol=<val> (sqlite json_set; fallback — sed по sockopt/tcpSettings).
+stream_set_accept_proxy_protocol() {
+    local settings="$1" val="$2" out=""
+    if command -v sqlite3 >/dev/null 2>&1; then
+        out="$(sqlite3 "$XUI_DB" "SELECT json_set('$(sql_escape "$settings")', '\$.sockopt.acceptProxyProtocol', json('$val'));" 2>/dev/null || true)"
+    fi
+    if [[ -z "$out" ]]; then
+        if [[ "$settings" == *'"acceptProxyProtocol"'* ]]; then
+            out="$(printf '%s' "$settings" | sed -E "s/\"acceptProxyProtocol\"[[:space:]]*:[[:space:]]*(true|false)/\"acceptProxyProtocol\": ${val}/")"
+        elif [[ "$settings" == *'"sockopt"[[:space:]]*:[[:space:]]*{'* ]]; then
+            out="$(printf '%s' "$settings" | sed "s/\"sockopt\"[[:space:]]*:[[:space:]]*{/\"sockopt\": {\n    \"acceptProxyProtocol\": ${val},/")"
+        elif [[ "$settings" == *'"tcpSettings"[[:space:]]*:[[:space:]]*{'* ]]; then
+            out="$(printf '%s' "$settings" | sed "s/\"tcpSettings\"[[:space:]]*:[[:space:]]*{/\"tcpSettings\": {\n    \"acceptProxyProtocol\": ${val},/")"
+        fi
+    fi
+    printf '%s' "$out"
+}
+
+# json_set_client_subid <settings_json> <email> <subid> — печатает settings
+# с заменённым subId у клиента с данным email (python3 json; fallback — sed).
+json_set_client_subid() {
+    local settings="$1" email="$2" subid="$3" out="" esc=""
+    if command -v python3 >/dev/null 2>&1; then
+        out="$(printf '%s' "$settings" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+email, subid = sys.argv[1], sys.argv[2]
+changed = False
+for c in data.get("clients", []):
+    if c.get("email") == email:
+        c["subId"] = subid
+        changed = True
+if not changed:
+    sys.exit(1)
+print(json.dumps(data, ensure_ascii=False))
+' "$email" "$subid" 2>/dev/null || true)"
+    fi
+    if [[ -z "$out" ]]; then
+        esc="$(printf '%s' "$email" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+        out="$(printf '%s' "$settings" | sed -E "s/(\"email\"[[:space:]]*:[[:space:]]*\"${esc}\"[^{]*\"subId\"[[:space:]]*:[[:space:]]*\")[^\"]*/\1${subid}/")"
+    fi
+    printf '%s' "$out"
+}
+
+# inbound_behind_master <transport> <sni> — 0, если инбаунд за stream-мастером
+# (наружу смотрит только 443, маршрутизация по SNI).
+inbound_behind_master() {
+    [[ "$1" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$2" ]]
+}
+
+# inbound_external_addr <transport> <port> <sni> — внешний адрес:порт инбаунда
+# для share-ссылок. За мастером xhttp+reality — SNI:443, иначе external_addr:port.
+inbound_external_addr() {
+    local transport="$1" port="$2" sni="$3"
+    if inbound_behind_master "$transport" "$sni"; then
+        printf '%s:%s' "$sni" "${STREAM_MASTER_PORT:-443}"
+    else
+        printf '%s:%s' "$(external_addr)" "$port"
+    fi
+}
 
 # gen_link_vless — vless:// ссылка.
 # link_external — адрес:порт для share-ссылки. Инбаунды (xhttp+reality, hysteria)
@@ -1359,11 +1455,7 @@ json_extract() {
 # наружу смотрит только 443: внешний адрес xhttp+reality = домен REALITY
 # (SNI маскировки), порт 443 (nginx маршрутизирует по SNI).
 link_external() {
-    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$REALITY_SNI" ]]; then
-        printf '%s:%s' "$REALITY_SNI" "${STREAM_MASTER_PORT:-443}"
-        return 0
-    fi
-    printf '%s:%s' "$(external_addr)" "$PORT"
+    inbound_external_addr "$TRANSPORT" "$PORT" "$REALITY_SNI"
 }
 
 gen_link_vless() {
@@ -1384,7 +1476,6 @@ gen_link_vless() {
             # mode=stream-one: обязателен для XHTTP+REALITY (mode=auto ломается
             # на Xray 26.1.31+; stream-one закрывает поведенческий анализ).
             q+=("path=${WS_PATH}")
-            [[ -n "$WS_HOST" ]] && q+=("host=${WS_HOST}")
             q+=("mode=stream-one")
             ;;
     esac
@@ -1392,16 +1483,29 @@ gen_link_vless() {
     printf '%s?%s#%s\n' "$link" "$(join_q "${q[@]}")" "$(urlencode "$REMARK")"
 }
 
+# cert_is_self_signed <cert> — 0, если сертификат самоподписанный (issuer == subject).
+cert_is_self_signed() {
+    local cert="$1" issuer="" subject=""
+    [[ -f "$cert" ]] || return 1
+    issuer="$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null | sed 's/^issuer[[:space:]]*=[[:space:]]*//')"
+    subject="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject[[:space:]]*=[[:space:]]*//')"
+    [[ -n "$issuer" && -n "$subject" && "$issuer" == "$subject" ]]
+}
+
 # gen_link_hysteria2 — hysteria2:// ссылка.
 gen_link_hysteria2() {
-    local addr link
+    local addr link insecure=""
     addr="$(external_addr)"
     link="hysteria2://$(urlencode "$CLIENT_AUTH")@${addr}:${PORT}"
     local q=("security=tls")
-    [[ -n "${SNI:-}" ]] && q+=("sni=${SNI}")
-    # Сертификат по IP (панель по IP, PANEL_HOST пуст) обычно самоподписанный —
-    # клиент не сможет его проверить: нужен insecure=1.
-    [[ -z "$PANEL_HOST" ]] && q+=("insecure=1")
+    q+=("sni=${addr}")
+    # insecure=1 — только для самоподписанного сертификата (issuer == subject):
+    # публичные сертификаты (Let's Encrypt, ZeroSSL) клиент проверит сам.
+    if [[ -z "$PANEL_CERT" ]] || cert_is_self_signed "$PANEL_CERT"; then
+        insecure="1"
+        warn "Сертификат канала самоподписанный — в ссылку добавлен insecure=1 (TLS-проверка клиентом отключена)."
+    fi
+    [[ -z "$insecure" ]] || q+=("insecure=1")
     q+=("alpn=h3" "fp=chrome")
     printf '%s?%s#%s\n' "$link" "$(join_q "${q[@]}")" "$(urlencode "$REMARK")"
 }
@@ -1471,7 +1575,7 @@ nginx_ensure_files() {
     mkdir -p "$dir_snip" "$dir_stream" || { warn "Не удалось создать каталоги nginx ($dir_snip, $dir_stream)."; return 1; }
     [[ -f "$NGINX_SNIPPET" ]] || { touch "$NGINX_SNIPPET" || return 1; }
     [[ -f "$NGINX_STREAM" ]] || { touch "$NGINX_STREAM" || return 1; }
-    [[ -s "$NGINX_SNIPPET" ]] || printf '%s\n' "# inbound-xray.sh: WS/gRPC/XHTTP regex-location'ы" > "$NGINX_SNIPPET"
+    [[ -s "$NGINX_SNIPPET" ]] || printf '%s\n' "# inbound-xray.sh: дополнительные location-правила" > "$NGINX_SNIPPET"
     [[ -s "$NGINX_STREAM" ]] || printf '%s\n' "# inbound-xray.sh: stream-правила (passthrough / stream-мастер)" > "$NGINX_STREAM"
 }
 
@@ -1535,7 +1639,7 @@ is_stream_443_master() {
 
 # nginx_stream_master_rebuild — пересобирает NGINX_STREAM в режиме мастера:
 # один server listen 443 с ssl_preread и map SNI → 127.0.0.1:<порт>.
-# default → внутренний http-модуль nginx (панель + WS/gRPC).
+    # default → первый REALITY-инбаунд (анти-зондирование); панель — только fallback, когда REALITY-инбаундов нет.
 # Инбаунды TLS/REALITY за nginx без SNI — отдельные passthrough-блоки.
 # stream_sni_in_map <map_lines> <sni> — занят ли ключ SNI в уже собранных
 # строках map stream-мастера (любым бэкендом). Печатает порт занявшего
@@ -1562,12 +1666,7 @@ nginx_stream_master_rebuild() {
         # Только TCP/XHTTP с SNI (REALITY/TLS); WS/gRPC идут через http-модуль.
         # xhttp+reality за мастером тоже получает строку в map по своему SNI.
         printf '%s' "$ss" | grep -qE '"network"[[:space:]]*:[[:space:]]*"(tcp|xhttp)"' || continue
-        sni=""
-        if printf '%s' "$ss" | grep -q '"realitySettings"'; then
-            sni="$(printf '%s' "$ss" | sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-        elif printf '%s' "$ss" | grep -q '"tlsSettings"'; then
-            sni="$(printf '%s' "$ss" | sed -n 's/.*"serverName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-        fi
+        sni="$(inbound_sni "$ss")"
         if [[ -n "$sni" ]]; then
             if [[ -z "$(stream_sni_in_map "$map_lines" "$sni")" ]]; then
                 map_lines="${map_lines}    ${sni}  127.0.0.1:${port};
@@ -1597,6 +1696,14 @@ server {
         real_def="$(sqlite3 "$XUI_DB" "SELECT port FROM inbounds WHERE protocol='vless' AND stream_settings LIKE '%realitySettings%' ORDER BY id LIMIT 1;" 2>/dev/null || true)"
     fi
     [[ -n "$real_def" ]] || real_def="$PANEL_SSL_PORT"
+    # Панель по IP (PANEL_HOST пуст): default оставляем на панели, иначе
+    # https://IP:443 уходит в REALITY-инбаунд и вход в панель теряется.
+    # Плата — анти-зондирование для неизвестных SNI отключается.
+    if [[ -z "$PANEL_HOST" && -n "$real_def" && "$real_def" != "$PANEL_SSL_PORT" ]]; then
+        warn "PANEL_HOST пуст (панель по IP): default stream-мастера направлен на панель."
+        warn "Неизвестные SNI (зондирование) попадут на панель, а не в REALITY."
+        real_def="$PANEL_SSL_PORT"
+    fi
     # Домен панели → http-модуль nginx (панель + WS/gRPC). Без этой строки
     # пересборка мастера теряет панель: её SNI уходил бы в default (REALITY)
     # и браузер получал бы чужой сертификат (ERR_CERT_COMMON_NAME_INVALID).
@@ -1671,16 +1778,13 @@ EOF
 stream_master_apply_proxy_protocol() {
     [[ -f "$NGINX_STREAM" ]] || return 0
     local rows="" row="" id="" ss="" sni="" accept="" cur="" settings="" new_settings=""
-    rows="$(sqlite3 "$XUI_DB" "SELECT id, replace(stream_settings, char(10), char(32)) FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1' AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
+    rows="$(sqlite3 "$XUI_DB" "SELECT id, replace(stream_settings, char(10), char(32)) FROM inbounds WHERE tag LIKE 'inbound-%' AND protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1' AND port != ${STREAM_MASTER_PORT:-443};" 2>/dev/null || true)"
     while IFS= read -r row; do
         [[ -z "$row" ]] && continue
         id="${row%%|*}"; ss="${row#*|}"
         printf '%s' "$ss" | grep -qE '"network"[[:space:]]*:[[:space:]]*"(tcp|xhttp)"' || continue
         printf '%s' "$ss" | grep -qE '"security"[[:space:]]*:[[:space:]]*"(reality|tls)"' || continue
-        sni="$(printf '%s' "$ss" | sed -nE 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
-        if [[ -z "$sni" ]]; then
-            sni="$(printf '%s' "$ss" | sed -nE 's/.*"serverName"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
-        fi
+        sni="$(inbound_sni "$ss")"
         if [[ -n "$sni" ]]; then
             accept="true"
         else
@@ -1689,15 +1793,9 @@ stream_master_apply_proxy_protocol() {
         cur="$(printf '%s' "$ss" | grep -oE '"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)' | head -1)"
         [[ "$cur" == "$accept" ]] && continue
         settings="$(sqlite3 "$XUI_DB" "SELECT stream_settings FROM inbounds WHERE id = $id;" 2>/dev/null || true)"
-        if printf '%s' "$settings" | grep -q '"acceptProxyProtocol"'; then
-            new_settings="$(printf '%s' "$settings" | sed -E 's/"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)/"acceptProxyProtocol": '"$accept"'/')"
-        elif printf '%s' "$settings" | grep -q '"sockopt"[[:space:]]*:[[:space:]]*{'; then
-            # XHTTP: acceptProxyProtocol лежит в sockopt (не в tcpSettings).
-            new_settings="$(printf '%s' "$settings" | sed 's/"sockopt"[[:space:]]*:[[:space:]]*{/"sockopt": {\n    "acceptProxyProtocol": '"$accept"',/')"
-        elif printf '%s' "$settings" | grep -q '"tcpSettings"[[:space:]]*:[[:space:]]*{'; then
-            new_settings="$(printf '%s' "$settings" | sed 's/"tcpSettings"[[:space:]]*:[[:space:]]*{/"tcpSettings": {\n    "acceptProxyProtocol": '"$accept"',/')"
-        else
-            warn "Не удалось вставить acceptProxyProtocol (id=$id): нет ни sockopt, ни tcpSettings."
+        new_settings="$(stream_set_accept_proxy_protocol "$settings" "$accept")"
+        if [[ -z "$new_settings" || "$new_settings" == "$settings" ]]; then
+            warn "Не удалось вставить acceptProxyProtocol (id=$id)."
             continue
         fi
         sqlite3 "$XUI_DB" "UPDATE inbounds SET stream_settings = '$(sql_escape "$new_settings")' WHERE id = $id;" \
@@ -1707,6 +1805,24 @@ stream_master_apply_proxy_protocol() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active x-ui >/dev/null 2>&1; then
         restart_xui
     fi
+}
+
+# list_xhttp_channels — XHTTP+REALITY каналы (слушают 127.0.0.1 за мастером).
+# Строки «id|port|tag|sni|path|target|pp», отсортированы по id.
+list_xhttp_channels() {
+    sqlite3 "$XUI_DB" "
+SELECT i.id, i.port, i.tag,
+       COALESCE(json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.xhttpSettings.path'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.realitySettings.target'), ''),
+       COALESCE(json_extract(i.stream_settings, '$.sockopt.acceptProxyProtocol'), '')
+FROM inbounds i
+WHERE i.protocol = 'vless'
+  AND i.listen = '127.0.0.1'
+  AND json_extract(i.stream_settings, '$.network') = 'xhttp'
+  AND json_extract(i.stream_settings, '$.security') = 'reality'
+  AND i.port != ${STREAM_MASTER_PORT:-443}
+ORDER BY i.id;" 2>/dev/null || true
 }
 
 # panel_audit — read-only проверка XHTTP+REALITY каналов и пользователей,
@@ -1723,7 +1839,7 @@ panel_audit() {
     want="127.0.0.1:${REALITY_TARGET_PORT:-9443}"
     banner ""
     banner "  ========== Проверка каналов панели =========="
-    while IFS='|' read -r id port tag sni target pp; do
+    while IFS='|' read -r id port tag sni path target pp; do
         [[ -n "$id" ]] || continue
         if [[ "$tag" == inbound-* ]]; then
             printf '  канал id=%s (порт %s): %s (скрипт)\n' "$id" "$port" "${sni:-<нет SNI>}"
@@ -1750,18 +1866,7 @@ panel_audit() {
             warn "acceptProxyProtocol != true (id=$id) — nginx шлёт PROXY-заголовок, канал может рвать соединения (исправит пункт 5)."
             issues=$((issues + 1))
         fi
-    done < <(sqlite3 "$XUI_DB" "
-SELECT i.id, i.port, i.tag,
-       COALESCE(json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'), ''),
-       COALESCE(json_extract(i.stream_settings, '$.realitySettings.target'), ''),
-       COALESCE(json_extract(i.stream_settings, '$.sockopt.acceptProxyProtocol'), '')
-FROM inbounds i
-WHERE i.protocol = 'vless'
-  AND i.listen = '127.0.0.1'
-  AND json_extract(i.stream_settings, '$.network') = 'xhttp'
-  AND json_extract(i.stream_settings, '$.security') = 'reality'
-  AND i.port != ${STREAM_MASTER_PORT:-443}
-ORDER BY i.id;" 2>/dev/null || true)
+    done < <(list_xhttp_channels)
     # Пользователи (клиенты) панели
     local bad_clients=0 cid="" cemail=""
     while IFS='|' read -r cid cemail; do
@@ -1788,7 +1893,7 @@ ORDER BY i.id;" 2>/dev/null || true)
 panel_sync() {
     [[ "$STREAM_443_MASTER" == "1" ]] || { warn "stream-мастер не активен — синхронизация не нужна."; return 0; }
     [[ -n "$XUI_DB" && -f "$XUI_DB" ]] || return 0
-    local changed=0 id="" port="" tag="" sni="" path="" target="" pp="" settings="" new_settings="" want="" esc="" esc_email=""
+    local changed=0 id="" port="" tag="" sni="" path="" target="" pp="" settings="" new_settings="" want="" esc=""
     local want="127.0.0.1:${REALITY_TARGET_PORT:-9443}"
     banner ""
     banner "  ========== Синхронизация каналов панели =========="
@@ -1811,48 +1916,33 @@ panel_sync() {
         # 3) acceptProxyProtocol=true (xhttp → sockopt)
         if [[ "$pp" != "true" && "$pp" != "1" ]]; then
             settings="$(sqlite3 "$XUI_DB" "SELECT stream_settings FROM inbounds WHERE id = $id;" 2>/dev/null || true)"
-            if [[ "$settings" == *'"acceptProxyProtocol"'* ]]; then
-                new_settings="$(sed -E 's/"acceptProxyProtocol"[[:space:]]*:[[:space:]]*(true|false)/"acceptProxyProtocol": true/' <<< "$settings")"
-            elif [[ "$settings" == *'"sockopt"'* ]]; then
-                new_settings="$(sed 's/"sockopt"[[:space:]]*:[[:space:]]*{/"sockopt": {\n    "acceptProxyProtocol": true,/' <<< "$settings")"
-            else
-                new_settings=""
-                warn "acceptProxyProtocol нельзя вставить (id=$id): нет sockopt в stream_settings."
-            fi
+            new_settings="$(stream_set_accept_proxy_protocol "$settings" true)"
             if [[ -n "$new_settings" && "$new_settings" != "$settings" ]]; then
                 sqlite3 "$XUI_DB" "UPDATE inbounds SET stream_settings = '$(sql_escape "$new_settings")' WHERE id = $id;" \
                     && ok "acceptProxyProtocol=true для канала id=$id" && changed=1 \
                     || warn "Не удалось обновить acceptProxyProtocol (id=$id)."
+            else
+                warn "acceptProxyProtocol нельзя вставить (id=$id): нет sockopt в stream_settings."
             fi
         fi
-    done < <(sqlite3 "$XUI_DB" "
-SELECT i.id, i.port, i.tag,
-       COALESCE(json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'), ''),
-       COALESCE(json_extract(i.stream_settings, '$.xhttpSettings.path'), ''),
-       COALESCE(json_extract(i.stream_settings, '$.realitySettings.target'), ''),
-       COALESCE(json_extract(i.stream_settings, '$.sockopt.acceptProxyProtocol'), '')
-FROM inbounds i
-WHERE i.protocol = 'vless'
-  AND i.listen = '127.0.0.1'
-  AND json_extract(i.stream_settings, '$.network') = 'xhttp'
-  AND json_extract(i.stream_settings, '$.security') = 'reality'
-  AND i.port != ${STREAM_MASTER_PORT:-443}
-ORDER BY i.id;" 2>/dev/null || true)
+    done < <(list_xhttp_channels)
     # 4) Клиенты без subId: генерируем, пишем в clients и в settings инбаундов,
     #    и привязываем к инбаунду (client_inbounds), если привязки нет.
     local cid="" cemail="" new_sub="" bindc=""
+    local iid="" settings="" new_settings="" esc="" all_rows=""
+    # Снимок всех инбаундов (id|settings) — один SELECT вместо N+1 по клиентам.
+    # settings уплощаем: sqlite3 печатает многострочные JSON отдельными строками,
+    # иначе цикл read разобьёт запись и subId в settings не обновится.
+    all_rows="$(sqlite3 "$XUI_DB" "SELECT id, replace(settings, char(10), char(32)) FROM inbounds;" 2>/dev/null || true)"
     while IFS='|' read -r cid cemail; do
         [[ -n "$cid" ]] || continue
         new_sub="$(gen_hex 16)"
         sqlite3 "$XUI_DB" "UPDATE clients SET sub_id = '$new_sub' WHERE id = $cid;" 2>/dev/null || true
-        esc_email="$(sql_escape "$cemail")"
-        local iids="" iid=""
-        iids="$(sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE settings LIKE '%\"email\"%${esc_email}%';" 2>/dev/null || true)"
-        while read -r iid; do
+        esc="$(printf '%s' "$cemail" | sed 's/[.[\*^$(){}?+|]/\\./g')"
+        while IFS='|' read -r iid settings; do
             [[ -n "$iid" ]] || continue
-            settings="$(sqlite3 "$XUI_DB" "SELECT settings FROM inbounds WHERE id = $iid;" 2>/dev/null || true)"
-            esc="$(sed 's/[.[\*^$(){}?+|]/\\./g' <<< "$cemail")"
-            new_settings="$(sed -E "s/(\"email\"[[:space:]]*:[[:space:]]*\"${esc}\"[^{]*\"subId\"[[:space:]]*:[[:space:]]*\")[^\"]*/\1${new_sub}/" <<< "$settings")"
+            printf '%s' "$settings" | grep -qE '"email"[[:space:]]*:[[:space:]]*"'"$esc"'"' || continue
+            new_settings="$(json_set_client_subid "$settings" "$cemail" "$new_sub")"
             if [[ -n "$new_settings" && "$new_settings" != "$settings" ]]; then
                 sqlite3 "$XUI_DB" "UPDATE inbounds SET settings = '$(sql_escape "$new_settings")' WHERE id = $iid;" 2>/dev/null || true
             fi
@@ -1862,7 +1952,7 @@ ORDER BY i.id;" 2>/dev/null || true)
                     && ok "Клиент «$cemail» привязан к инбаунду id=$iid." \
                     || warn "Не удалось привязать клиента «$cemail» к инбаунду id=$iid."
             fi
-        done <<< "$iids"
+        done <<< "$all_rows"
         ok "Клиенту «$cemail» присвоен subId ${new_sub} (в clients и settings инбаундов)."
         changed=1
     done < <(sqlite3 "$XUI_DB" "SELECT id, email FROM clients WHERE sub_id IS NULL OR sub_id = '';" 2>/dev/null || true)
@@ -1955,13 +2045,13 @@ nginx_stream_master_setup() {
 
     # Порт в hosts-записях TLS/REALITY за прокси → 443
     if db_has_column hosts port; then
-        sqlite3 "$XUI_DB" "UPDATE hosts SET port = ${STREAM_MASTER_PORT:-443} WHERE inbound_id IN (SELECT id FROM inbounds WHERE protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1');" 2>/dev/null || true
+        sqlite3 "$XUI_DB" "UPDATE hosts SET port = ${STREAM_MASTER_PORT:-443} WHERE inbound_id IN (SELECT id FROM inbounds WHERE tag LIKE 'inbound-%' AND protocol IN ('vless','vmess','trojan') AND listen = '127.0.0.1');" 2>/dev/null || true
     fi
 
     PROXY_PORT="${STREAM_MASTER_PORT:-443}"
     PROXY_SCHEME="https"
     firewall_port_open "${STREAM_MASTER_PORT:-443}" tcp
-    ok "Всё внешнее трафик теперь через ${STREAM_MASTER_PORT:-443} (stream-мастер)."
+    ok "Весь внешний трафик теперь через ${STREAM_MASTER_PORT:-443} (stream-мастер)."
     ok "Панель доступна: https://${PANEL_HOST:-$(external_addr)}${PANEL_PATH:-/}"
 }
 
@@ -2176,8 +2266,7 @@ print_summary() {
     if [[ -n "$link" ]]; then
         printf '%s\n' "  ${C_GREEN}Ссылка для клиента:${C_RESET}"
         printf '%s\n' "  $link"
-        printf '%s\n' "  (дублируется в $LOG_FILE)"
-        printf '%s\n' "$link" >> "$LOG_FILE"
+        printf '%s\n' "  (в лог не пишется — сохраните ссылку)"
     fi
 
     [[ "$SECURITY" == "reality" ]] && {
@@ -2185,7 +2274,6 @@ print_summary() {
     }
     if [[ "$SUB_ENABLE" == "true" && -n "$CLIENT_SUBID" ]]; then
         printf '%s\n' "  ${C_GREEN}Подписка (Sub URL):${C_RESET} $(sub_url "$CLIENT_SUBID")"
-        printf 'Sub URL: %s\n' "$(sub_url "$CLIENT_SUBID")" >> "$LOG_FILE"
     fi
     banner ""
     info "Инбаунд создан. Панель: x-ui → «Список inbound» (id ${INBOUND_ID:-?})."
@@ -2261,6 +2349,25 @@ set_panel_base_path() {
     info "webBasePath панели установлен: ${PANEL_PATH:-/}"
 }
 
+# proxy_location <путь> <апстрим> <доп.строки> — nginx location-блок с единым
+# набором proxy_set_header и таймаутов для проксируемых location'ов.
+proxy_location() {
+    local path="$1" upstream="$2" extra="${3:-}"
+    printf '    location %s {
+        proxy_pass %s;
+%s
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }' "$path" "$upstream" "$extra"
+}
+
 # write_panel_conf <файл> <landing|panel> — переписывает nginx-конфиг панели
 # (location /<путь>/ → proxy_pass; location / → заглушка или панель) с бэкапом
 # и откатом при ошибке nginx -t.
@@ -2295,41 +2402,16 @@ write_panel_conf() {
         local sub_loc_path="${SUB_PATH:-/sub/}"
         [[ "$sub_loc_path" == /* ]] || sub_loc_path="/${sub_loc_path}"
         [[ "$sub_loc_path" == */ ]] || sub_loc_path="${sub_loc_path}/"
-        sub_loc="    location ${sub_loc_path} {
-        proxy_pass http://127.0.0.1:${SUB_PORT};
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_http_version 1.1;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-
-"
+        sub_loc="$(proxy_location "$sub_loc_path" "http://127.0.0.1:${SUB_PORT}" "")"
+        sub_loc="${sub_loc}"$'\n\n'
     fi
 
     local panel_loc=""
     # Панель на скрытом пути — в любом режиме (landing и panel) не переезжает
     # на корень: включение/выключение заглушки не меняет адрес панели.
     if [[ -n "$PANEL_PATH" && "$PANEL_PATH" != "/" && "$PANEL_PATH" != "./" ]]; then
-        panel_loc="    location ${PANEL_PATH} {
-        proxy_pass ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT};
-${up_extra}
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_http_version 1.1;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-
-"
+        panel_loc="$(proxy_location "$PANEL_PATH" "${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}" "$up_extra")"
+        panel_loc="${panel_loc}"$'\n\n'
     fi
 
     local root_loc=""
@@ -2345,26 +2427,21 @@ ${up_extra}
         index index.html;
     }"
     else
-        root_loc="    location / {
-        proxy_pass ${PANEL_PROTO}://127.0.0.1:${PANEL_PORT};
-${up_extra}
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_http_version 1.1;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }"
+        root_loc="$(proxy_location "/" "${PANEL_PROTO}://127.0.0.1:${PANEL_PORT}" "$up_extra")"
     fi
 
-    local bak
+    local bak ts
     bak="$(mktemp)"
     [[ -f "$file" ]] && cp -a "$file" "$bak"
+    # Персистентный бэкап перед перезаписью: ручные правки оператора не теряются
+    # (временный $bak удаляется после успешного nginx -t).
+    ts="$(date +%Y%m%d-%H%M%S)"
+    mkdir -p /root/backups-nginx 2>/dev/null || true
+    [[ -f "$file" ]] && cp -a "$file" "/root/backups-nginx/$(basename "$file").${ts}" 2>/dev/null || true
+    # Ротация: оставляем последние 10 версий
+    ls -1t /root/backups-nginx/* 2>/dev/null | tail -n +11 | xargs -r rm -f 2>/dev/null || true
     mkdir -p "$(dirname "$file")" || { warn "Не удалось создать каталог $(dirname "$file")."; return 1; }
-    # WS/gRPC regex-location'ы живут в общем сниппете — подключаем его в server
+    # дополнительные location-правила живут в общем сниппете — подключаем его в server
     nginx_ensure_files
     local snippet_line="    include ${NGINX_SNIPPET};"
     # Второй server-блок для корневого домена (заглушка со своим сертификатом):
@@ -2556,6 +2633,12 @@ setup_subscription() {
     else
         base="$PANEL_PROTO://$(external_addr)"
         ext="$(external_addr)"
+        warn "Подписка включается без nginx — по открытому HTTP."
+        warn "subId — единственный токен к конфигам с UUID/паролями: возможен перехват (MITM)."
+        if command -v nginx >/dev/null 2>&1; then
+            warn "Рекомендуется настроить nginx-прокси панели, чтобы подписка шла через TLS."
+        fi
+        confirm "Продолжить включение подписки без TLS?" || return 1
     fi
     db_set_setting "subEnable" "true"
     db_set_setting "subDomain" "$ext"
@@ -2590,11 +2673,10 @@ setup_subscription() {
 create_channel() {
     # Сброс данных предыдущего клиента
     CLIENT_EMAIL=""; CLIENT_SUBID=""; CLIENT_FLOW=""
-    CLIENT_ID=""; CLIENT_PW=""; CLIENT_AUTH=""
-    CLIENT_SECRET=""
-    INBOUND_ID=""; WS_PATH=""; WS_HOST=""; SNI=""; LISTEN=""
+    CLIENT_ID=""; CLIENT_AUTH=""
+    INBOUND_ID=""; WS_PATH=""; LISTEN=""
     REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""; REALITY_SNI=""
-    CHANNEL_SNI=""; CHANNEL_CERT_DIR=""; REUSE_CLIENT=""; EXISTING_CLIENT_ID=""; CLIENT_SELECT=""
+    REUSE_CLIENT=""; EXISTING_CLIENT_ID=""; CLIENT_SELECT=""
 
     menu_protocol
 
@@ -2665,6 +2747,10 @@ create_channel() {
         while true; do
             ask "Email клиента" "$def_email" CLIENT_EMAIL
             [[ -n "$CLIENT_EMAIL" ]] || die "Email клиента обязателен."
+            if [[ "$CLIENT_EMAIL" == *'"'* || "$CLIENT_EMAIL" == *$'\n'* ]]; then
+                warn "Email не должен содержать двойные кавычки или перевод строки."
+                continue
+            fi
             local dup=""
             dup="$(sqlite3 "$XUI_DB" "SELECT id FROM clients WHERE email = '$(sql_escape "$CLIENT_EMAIL")' LIMIT 1;" 2>/dev/null || true)"
             if [[ -n "$dup" ]]; then
@@ -2699,6 +2785,10 @@ create_channel() {
             # Путь XHTTP — уникальный location прямого TCP-порта, формат /x<hex>.
             while true; do
                 ask "Путь XHTTP (уникальный, формат /x<name>)" "/x$(gen_hex 5)" WS_PATH
+                if ! [[ "$WS_PATH" =~ ^/[A-Za-z0-9_-]+$ ]]; then
+                    warn "Путь должен быть вида /x<name> (латиница, цифры, _ и -)."
+                    continue
+                fi
                 if db_path_in_use "$WS_PATH"; then
                     warn "Путь $WS_PATH уже используется другим инбаундом."
                     confirm "Продолжить с тем же путём?" || continue
@@ -2720,28 +2810,30 @@ create_channel() {
             base_domain="$PANEL_HOST"
         fi
         while true; do
-            ask "Домен REALITY (SNI маскировки, A-запись → сервер)" "$base_domain" CHANNEL_SNI
-            [[ -n "$CHANNEL_SNI" ]] || { warn "Домен REALITY обязателен."; continue; }
-            if [[ -n "$PANEL_HOST" && "$CHANNEL_SNI" == "$PANEL_HOST" ]]; then
+            ask "Домен REALITY (SNI маскировки, A-запись → сервер)" "$base_domain" REALITY_SNI
+            [[ -n "$REALITY_SNI" ]] || { warn "Домен REALITY обязателен."; continue; }
+            if ! [[ "$REALITY_SNI" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                warn "Домен может содержать только латиницу, цифры, точки и дефисы."
+                continue
+            fi
+            if [[ -n "$PANEL_HOST" && "$REALITY_SNI" == "$PANEL_HOST" ]]; then
                 if [[ "$STREAM_443_MASTER" == "1" ]]; then
-                    die "SNI=$CHANNEL_SNI совпадает с доменом панели: на 443 канал перехватит весь трафик панели. Укажи отдельный поддомен (напр. v.${base_domain:-<домен>})."
+                    die "SNI=$REALITY_SNI совпадает с доменом панели: на 443 канал перехватит весь трафик панели. Укажи отдельный поддомен (напр. v.${base_domain:-<домен>})."
                 fi
                 warn "SNI совпадает с доменом панели: панель и REALITY будут конфликтовать на 443."
                 warn "Переведи панель на поддомен (напр. p.${base_domain:-<домен>}) или укажи другой SNI."
             fi
             if [[ "$STREAM_443_MASTER" == "1" && -n "$PANEL_HOST" \
-                && "$CHANNEL_SNI" == "$(domain_root "$PANEL_HOST")" ]]; then
-                die "SNI=$CHANNEL_SNI — корневой домен панели: заглушка корня/панель сломаются на 443. Укажи поддомен (напр. v.${CHANNEL_SNI})."
+                && "$REALITY_SNI" == "$(domain_root "$PANEL_HOST")" ]]; then
+                die "SNI=$REALITY_SNI — корневой домен панели: заглушка корня/панель сломаются на 443. Укажи поддомен (напр. v.${REALITY_SNI})."
             fi
-            if db_sni_in_use "$CHANNEL_SNI" reality; then
-                warn "SNI $CHANNEL_SNI уже используется другим REALITY-инбаундом."
+            if db_sni_in_use "$REALITY_SNI" reality; then
+                warn "SNI $REALITY_SNI уже используется другим REALITY-инбаундом."
                 warn "При одинаковом SNI инбаунды на одном порту не различить."
                 continue
             fi
             break
         done
-        REALITY_SNI="$CHANNEL_SNI"
-        SNI="$REALITY_SNI"
         # Target REALITY: за stream-мастером — локальная nginx-заглушка
         # 127.0.0.1:9443 (иначе target="${REALITY_SNI}:443" рекурсивно указывает
         # на сам сервер: XHTTP+REALITY ломается — невалидные зонды уходят в
@@ -2765,12 +2857,6 @@ create_channel() {
             warn "Ядро панели: $xray_ver — настрой клиент (v2rayNG) на ту же версию."
         fi
     fi
-    if [[ "$TRANSPORT" == "hysteria" ]]; then
-        # Hysteria2 верифицирует TLS по SNI. Без него клиент подставляет IP —
-        # сертификат панели не совпадает, рукопожатие падает. Берём внешний
-        # адрес (домен из SAN сертификата или IP сервера).
-        SNI="$(external_addr)"
-    fi
     if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" ]]; then
         # Вариант «за nginx»: инбаунд сидит на 127.0.0.1:<порт> и наружу не
         # смотрит — снаружи виден только 443, маршрутизацию по SNI делает
@@ -2780,7 +2866,11 @@ create_channel() {
 
     local settings_json stream_json snf_json
     settings_json="$(build_settings "$PROTOCOL" "$CLIENT_JSON")"
-    stream_json="$(build_stream "$TRANSPORT" "$WS_PATH" "$WS_HOST" "$SNI")"
+    if [[ "$TRANSPORT" == "xhttp" ]]; then
+        stream_json="$(build_stream "$TRANSPORT" "$WS_PATH" "$REALITY_SNI")"
+    else
+        stream_json="$(build_stream "$TRANSPORT" "$WS_PATH" "$(external_addr)")"
+    fi
 
     if [[ "$PROTOCOL" == "hysteria" ]]; then
         snf_json="$(sniffing_json 0)"
@@ -2795,7 +2885,7 @@ create_channel() {
     ok "Клиент «$CLIENT_EMAIL» добавлен."
     # XHTTP+REALITY за мастером: hosts-запись, чтобы подписка отдавала
     # <SNI>:443, а не внутренний inbounds.port (снаружи закрыт ufw).
-    if [[ "$TRANSPORT" == "xhttp" && "$STREAM_443_MASTER" == "1" && -n "$REALITY_SNI" ]]; then
+    if inbound_behind_master "$TRANSPORT" "$REALITY_SNI"; then
         db_ensure_host_record "$INBOUND_ID" "$REALITY_SNI" "$WS_PATH"
     fi
 
@@ -2825,15 +2915,10 @@ create_channel() {
 # Главный поток
 # =============================================================================
 
-main() {
-    setup_log
-    banner "inbound-xray.sh v${SCRIPT_VERSION} — настройка Xray-инбаундов для 3x-ui"
-    banner "Поддержка панели 3x-ui v3.6+ (формат базы данных)."
-    banner ""
-    require_root
-    detect_os
-    require_tools
-    load_panel_env
+# startup_tasks — стартовые диагностика и миграции (до интерактивного меню):
+# синхронизация webCert, stream-мастер, hosts-миграция, подписка, аудит.
+# Отключается флагом XUI_NO_AUTOFIX=1 (только меню, без сайд-эффектов).
+startup_tasks() {
     sync_panel_webcert
     if command -v nginx >/dev/null 2>&1; then
         nginx_ensure_files || warn "Не удалось подготовить файлы nginx."
@@ -2841,13 +2926,7 @@ main() {
         # «Всё через 443» включается автоматически: stream-мастер на 443,
         # все инбаунды и панель выходят наружу через единый 443.
         if is_stream_443_master; then
-            # Пересобираем stream.conf из БД: держим proxy_protocol и SNI-map
-            # актуальными (старые конфиги без proxy_protocol ломают инбаунды
-            # с acceptProxyProtocol=true).
             nginx_stream_master_rebuild || warn "Не удалось пересобрать stream-мастер."
-            # Конфиг панели тоже должен принимать PROXY-заголовок мастера:
-            # без listen ... proxy_protocol все запросы через 443 (WS/gRPC/XHTTP
-            # и сама панель) молча падают.
             local pconf="$NGINX_CONF"
             if [[ -z "$pconf" || ! -f "$pconf" ]]; then
                 detect_nginx_conf
@@ -2857,10 +2936,7 @@ main() {
             local pmode="panel"
             [[ -n "$ENABLE_LANDING" ]] && pmode="landing"
             write_panel_conf "$pconf" "$pmode" || warn "Не удалось обновить конфиг панели (proxy_protocol)."
-            # Лимиты воркера nginx (иначе 768 коннекшнов не хватает на единственный
-            # 443 и соединения к xray сбрасываются — «подключён без трафика»).
             nginx_worker_tune || true
-            # REALITY target-заглушка: без неё xhttp+reality ломается рекурсией.
             if [[ -n "$PANEL_HOST" ]]; then
                 nginx_reality_target_server "$PANEL_HOST" || true
             fi
@@ -2868,14 +2944,21 @@ main() {
             nginx_stream_master_setup auto
         fi
     fi
-    # Миграция hosts-записей для существующих XHTTP+REALITY каналов за мастером:
-    # старые каналы создавались без hosts-записи, подписка отдавала внутренний
-    # inbounds.port (снаружи закрыт). address=SNI, port=443.
+    # Миграция hosts-записей для существующих XHTTP+REALITY каналов за мастером
+    # (см. Fix 20 — тело цикла переносится сюда без изменений, с исправленным
+    # снимком и параметром skip).
     if [[ "$STREAM_443_MASTER" == "1" ]]; then
-        local hid="" hsni="" hpath=""
+        local hid="" hsni="" hpath="" existing_hosts="" h=""
+        # Существующие hosts-записи — один SELECT вместо COUNT на каждый канал
+        existing_hosts="$(sqlite3 "$XUI_DB" "SELECT GROUP_CONCAT(inbound_id) FROM hosts;" 2>/dev/null || true)"
+        local -A has_host=()
+        for h in ${existing_hosts//,/ }; do
+            [[ -n "$h" ]] && has_host["$h"]=1
+        done
         while IFS='|' read -r hid hsni hpath; do
             [[ -n "$hid" ]] || continue
-            db_ensure_host_record "$hid" "$hsni" "$hpath"
+            [[ -n "${has_host[$hid]:-}" ]] && continue
+            db_ensure_host_record "$hid" "$hsni" "$hpath" skip
         done < <(sqlite3 "$XUI_DB" "
 SELECT i.id,
        json_extract(i.stream_settings, '$.realitySettings.serverNames[0]'),
@@ -2893,6 +2976,22 @@ WHERE i.listen = '127.0.0.1'
     fi
     # Отчёт о каналах/пользователях, созданных через панель (исправление — пункт 5)
     panel_audit
+}
+
+main() {
+    setup_log
+    banner "inbound-xray.sh v${SCRIPT_VERSION} — настройка Xray-инбаундов для 3x-ui"
+    banner "Поддержка панели 3x-ui v3.6+ (формат базы данных)."
+    banner ""
+    require_root
+    detect_os
+    require_tools
+    load_panel_env
+    if [[ "${XUI_NO_AUTOFIX:-}" != "1" ]]; then
+        startup_tasks
+    else
+        info "XUI_NO_AUTOFIX=1 — стартовые диагностика/миграции пропущены."
+    fi
 
     while true; do
         banner ""
