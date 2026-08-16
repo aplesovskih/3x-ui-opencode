@@ -1155,22 +1155,36 @@ SELECT last_insert_rowid();")" || die "Ошибка вставки inbound в б
 # db_ensure_host_record <inbound_id> <sni> <path> — hosts-запись для инбаунда
 # за stream-мастером. Без неё подписка отдаёт inbounds.port (например 10000),
 # а снаружи открыт только 443 → «подключён без трафика». address=sni, port=443.
+# UPSERT: при изменении SNI/пути канала в панели существующие hosts-записи
+# обновляются — иначе подписка (hosts-приоритет) отдаёт устаревший SNI.
+# 4-й аргумент (skip_check) сохранён для совместимости с миграцией hosts —
+# при UPSERT проверка наличия записи не требуется.
 db_ensure_host_record() {
-    local id="${1:-}" sni="${2:-}" path="${3:-}" skip_check="${4:-}"
+    local id="${1:-}" sni="${2:-}" path="${3:-}"
     [[ -n "$id" && "$sni" ]] || return 0
-    if [[ "$skip_check" != "skip" ]]; then
-        local exists=""
-        exists="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id;" 2>/dev/null || true)"
-        [[ -n "$exists" && "$exists" != "0" ]] && return 0
+    local want_port="${STREAM_MASTER_PORT:-443}"
+    local found=0 hid="" haddr="" hport="" hsec="" hsni="" hpath="" up_cols=""
+    if db_has_column hosts updated_at; then
+        up_cols=", updated_at = $(date +%s000)"
     fi
+    while IFS='|' read -r hid haddr hport hsec hsni hpath; do
+        [[ -n "$hid" ]] || continue
+        found=1
+        if [[ "$haddr" != "$sni" || "${hport:-0}" != "$want_port" || "$hsec" != "reality" || "$hsni" != "$sni" || "$hpath" != "$path" ]]; then
+            sqlite3 "$XUI_DB" "UPDATE hosts SET address = '$(sql_escape "$sni")', port = $want_port, security = 'reality', sni = '$(sql_escape "$sni")', path = '$(sql_escape "$path")'${up_cols} WHERE id = $hid;" 2>/dev/null \
+                && ok "hosts-запись id=$hid обновлена: ${sni}:${want_port} (канал id=$id)." \
+                || warn "Не удалось обновить hosts-запись id=$hid для канала id=$id."
+        fi
+    done < <(sqlite3 "$XUI_DB" "SELECT id, COALESCE(address,''), COALESCE(port,0), COALESCE(security,''), COALESCE(sni,''), COALESCE(path,'') FROM hosts WHERE inbound_id = $id AND COALESCE(is_disabled,0) = 0;" 2>/dev/null || true)
+    [[ "$found" == "1" ]] && return 0
     local time_cols="" time_vals=""
     if db_has_column hosts created_at; then
         time_cols=", created_at, updated_at"
         time_vals=", $(date +%s000), $(date +%s000)"
     fi
-    sqlite3 "$XUI_DB" "INSERT INTO hosts (inbound_id, remark, address, port, security, sni, host_header, path, alpn, fingerprint${time_cols}) VALUES ($id, 'master-$(sql_escape "$sni")', '$(sql_escape "$sni")', ${STREAM_MASTER_PORT:-443}, 'reality', '$(sql_escape "$sni")', '', '$(sql_escape "$path")', '', 'chrome'${time_vals});" 2>/dev/null \
+    sqlite3 "$XUI_DB" "INSERT INTO hosts (inbound_id, remark, address, port, security, sni, host_header, path, alpn, fingerprint${time_cols}) VALUES ($id, 'master-$(sql_escape "$sni")', '$(sql_escape "$sni")', $want_port, 'reality', '$(sql_escape "$sni")', '', '$(sql_escape "$path")', '', 'chrome'${time_vals});" 2>/dev/null \
         || warn "Не удалось создать hosts-запись для inbound id=$id."
-    ok "hosts-запись для подписки: ${sni}:${STREAM_MASTER_PORT:-443}"
+    ok "hosts-запись для подписки: ${sni}:${want_port}"
 }
 
 # db_add_client_records <inbound_id> — таблицы clients/client_inbounds/client_traffics.
@@ -1857,10 +1871,18 @@ panel_audit() {
             warn "target=${target:-<пусто>} вместо ${want} — рекурсия REALITY ломает канал (исправит пункт 5)."
             issues=$((issues + 1))
         fi
-        hcount="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id;" 2>/dev/null || true)"
+        hcount="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id AND COALESCE(is_disabled,0) = 0;" 2>/dev/null || true)"
         if [[ -n "$hcount" && "$hcount" == "0" ]]; then
             warn "Нет hosts-записи для канала id=$id — подписка отдаст внутренний порт (исправит пункт 5)."
             issues=$((issues + 1))
+        else
+            # hosts есть, но могла устареть при смене SNI/пути канала в панели —
+            # подписка строится из hosts и отдаст старые данные.
+            hcount="$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM hosts WHERE inbound_id = $id AND COALESCE(is_disabled,0) = 0 AND (COALESCE(address,'') != '$sni' OR COALESCE(port,0) != ${STREAM_MASTER_PORT:-443} OR COALESCE(security,'') != 'reality' OR COALESCE(sni,'') != '$sni' OR COALESCE(path,'') != '$path');" 2>/dev/null || true)"
+            if [[ -n "$hcount" && "$hcount" != "0" ]]; then
+                warn "hosts-запись канала id=$id устарела (SNI/порт/путь ≠ канала) — подписка отдаст старые данные (исправит пункт 5)."
+                issues=$((issues + 1))
+            fi
         fi
         if [[ "$pp" != "true" && "$pp" != "1" ]]; then
             warn "acceptProxyProtocol != true (id=$id) — nginx шлёт PROXY-заголовок, канал может рвать соединения (исправит пункт 5)."
